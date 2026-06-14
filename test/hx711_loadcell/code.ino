@@ -1,8 +1,8 @@
 
 #include <HX711.h>
 
-#define DOUT_PIN A3
-#define SCK_PIN  A2
+#define DOUT_PIN 26
+#define SCK_PIN  27
 
 HX711 scale;
 
