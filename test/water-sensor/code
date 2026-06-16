@@ -2,8 +2,7 @@
 #define WATER_SENSOR_PIN     36   // chan S - bat buoc ADC
 #define WATER_SENSOR_VCC_PIN 32   // chan + - set HIGH de cap nguon
 
-// ===== Relay (IN o phia phai, DC+/DC- ve VIN/GND phia trai) =====
-#define RELAY_PIN 5
+#define RELAY_PIN 25
 
 void setup() {
   Serial.begin(115200);
