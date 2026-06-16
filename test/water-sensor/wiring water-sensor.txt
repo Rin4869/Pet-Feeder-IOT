@@ -6,7 +6,7 @@ Water Sensor:
 Relay:
   DC-  (GND) → ESP32 GND
   DC+  (VCC) → ESP32 VIN (5V)
-  IN         → ESP32 GPIO 5
+  IN         → ESP32 GPIO 25
 
 Bơm:
   COM        → Bơm (+)
