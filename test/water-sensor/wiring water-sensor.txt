@@ -1,0 +1,14 @@
+Water Sensor:
+  - (GND)    → ESP32 GND
+  + (VCC)    → ESP32 GPIO 32
+  S (Signal) → ESP32 GPIO 36
+
+Relay:
+  DC-  (GND) → ESP32 GND
+  DC+  (VCC) → ESP32 VIN (5V)
+  IN         → ESP32 GPIO 5
+
+Bơm:
+  COM        → Bơm (+)
+  NO         → Nguồn 5V riêng (+)
+  Nguồn 5V (-) → Bơm (-)
