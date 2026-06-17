@@ -30,9 +30,9 @@ void loop() {
   // 2. Relay - bat/tat bom de nghe tieng click va quan sat bom chay
   digitalWrite(RELAY_PIN, HIGH);
   Serial.println("Relay/Bom: ON");
-  delay(1500);
+  delay(30000);
 
   digitalWrite(RELAY_PIN, LOW);
   Serial.println("Relay/Bom: OFF");
-  delay(1500);
+  delay(30000);
 }
