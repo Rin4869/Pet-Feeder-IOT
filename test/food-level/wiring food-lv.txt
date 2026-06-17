@@ -1,4 +1,10 @@
+HX711
 HX711 GND  → ESP32 GND
 HX711 VCC  → ESP32 3.3V
 HX711 DT   → ESP32 GPIO 23 (D23)
 HX711 SCK  → ESP32 GPIO 22 (D22)
+
+servo
+GND(nâu) -	GND
+Power(đỏ) -	Cổng VIN
+Signal(vàng) - GPIO 13 
