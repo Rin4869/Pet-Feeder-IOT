@@ -11,3 +11,17 @@ SCL	- GPIO 22
 S (Signal)	GPIO 36
 VCC (+)	GPIO 32
 GND (-)	GND (Rail -)
+
+-Relay Module-
+DC+	- (Rail +)
+DC-	GND (Rail -)
+IN	- GPIO 25
+
+-Relay Terminal	Connection-
+COM	Positive (+) 
+NO	Pump Positive (+)
+NC	Not Used
+
+-Water Pump-
+Positive (+)	Relay NO
+Negative (-)	GND (Rail -)
