@@ -32,3 +32,9 @@ Negative (-)	GND (Rail -)
 Red (VCC)	- (Rail +)
 Brown/Black (GND) -	GND (Rail -)
 Yellow/Orange (Signal) -	GPIO 13
+
+-HX711-
+VCC	- 3.3V
+GND	- GND (Rail -)
+DT - GPIO 23
+SCK	- GPIO 14
