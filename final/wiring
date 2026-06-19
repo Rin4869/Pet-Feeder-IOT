@@ -1,8 +1,11 @@
+-ESP32-
+GND - raid (-)
+
 -LCD-
-LCD1602 I2C	VCC - Rail +
-LCD1602 I2C	GND -	GND Rail -
-LCD1602 I2C	SDA -	GPIO 21
-LCD1602 I2C	SCL	- GPIO 22
+VCC - Rail +
+GND -	GND Rail -
+SDA -	GPIO 21
+SCL	- GPIO 22
 
 -Water sensor-
 Water Sensor	S (Signal)	GPIO 36
