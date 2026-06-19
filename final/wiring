@@ -1,0 +1,34 @@
+# ESP32 Pet Feeder - Wiring Connections
+
+| Module         | Pin                    | ESP32 / Power Connection  |
+| -------------- | ---------------------- | ------------------------- |
+| HX711          | VCC                    | 3.3V                      |
+| HX711          | GND                    | GND (Rail -)              |
+| HX711          | DT (DOUT)              | GPIO 23                   |
+| HX711          | SCK                    | GPIO 14                   |
+| Water Sensor   | S (Signal)             | GPIO 36                   |
+| Water Sensor   | VCC (+)                | GPIO 32                   |
+| Water Sensor   | GND (-)                | GND (Rail -)              |
+| Relay Module   | DC+                    | 5V (Rail +)               |
+| Relay Module   | DC-                    | GND (Rail -)              |
+| Relay Module   | IN                     | GPIO 25                   |
+| Servo Motor    | Signal (Yellow/Orange) | GPIO 13                   |
+| Servo Motor    | VCC (Red)              | 5V (Rail +)               |
+| Servo Motor    | GND (Brown/Black)      | GND (Rail -)              |
+| LCD1602 I2C    | VCC                    | 5V (Rail +)               |
+| LCD1602 I2C    | GND                    | GND (Rail -)              |
+| LCD1602 I2C    | SDA                    | GPIO 21                   |
+| LCD1602 I2C    | SCL                    | GPIO 22                   |
+| Water Pump     | Positive (+)           | Relay NO                  |
+| Water Pump     | Negative (-)           | GND (Rail -)              |
+| Relay Terminal | COM                    | Power Supply Positive (+) |
+| Relay Terminal | NO                     | Water Pump Positive (+)   |
+| Relay Terminal | NC                     | Not Connected             |
+
+## Power Supply
+
+| Source          | Connection |
+| --------------- | ---------- |
+| Adapter 5V (+)  | Rail +     |
+| Adapter GND (-) | Rail -     |
+| ESP32 GND       | Rail -     |
