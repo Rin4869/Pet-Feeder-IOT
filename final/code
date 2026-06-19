@@ -1,1 +1,155 @@
+#include <HX711.h>
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
+// ===== HX711 / Load cell =====
+#define DOUT_PIN 23
+#define SCK_PIN  14
+
+// ===== Water Sensor =====
+#define WATER_SENSOR_PIN     36
+#define WATER_SENSOR_VCC_PIN 32
+
+// ===== Relay + Bom =====
+#define RELAY_PIN 25
+
+// ===== Servo =====
+#define SERVO_PIN 13
+
+// ===== Nguong =====
+#define WATER_MIN       100
+#define WATER_MAX       3000
+#define WATER_LOW_PCT   30
+#define WATER_HIGH_PCT  70
+#define FOOD_LOW_GRAM   50
+#define SCALE_FACTOR    400.0  // chinh lai sau khi calibrate
+
+HX711 scale;
+Servo myServo;
+LiquidCrystal_I2C lcd(0x27, 16, 2);  // doi thanh 0x3F neu khong hien thi
+
+// ===== Doc muc nuoc (%) =====
+int readWaterLevel() {
+  digitalWrite(WATER_SENSOR_VCC_PIN, HIGH);
+  delay(100);
+  int raw = analogRead(WATER_SENSOR_PIN);
+  digitalWrite(WATER_SENSOR_VCC_PIN, LOW);
+  int pct = map(raw, WATER_MIN, WATER_MAX, 0, 100);
+  return constrain(pct, 0, 100);
+}
+
+// ===== Doc trong luong thuc an (gram) =====
+float readFoodWeight() {
+  if (!scale.is_ready()) return -1;
+  return scale.get_units(10);
+}
+
+// ===== Hien thi len LCD =====
+void updateLCD(int waterPct, float foodGram, String status) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Food:");
+  lcd.print((int)foodGram);
+  lcd.print("g Water:");
+  lcd.print(waterPct);
+  lcd.print("%");
+  lcd.setCursor(0, 1);
+  lcd.print(status);
+}
+
+// ===== Bom nuoc cho den khi dat nguong =====
+void pumpWater() {
+  Serial.println("Nuoc thap -> Bat bom...");
+  lcd.setCursor(0, 1);
+  lcd.print("Dang bom nuoc...   ");
+
+  int pct = readWaterLevel();
+  while (pct < WATER_HIGH_PCT) {
+    digitalWrite(RELAY_PIN, HIGH);
+    delay(500);
+    pct = readWaterLevel();
+    Serial.print("Dang bom... Muc nuoc: ");
+    Serial.print(pct);
+    Serial.println("%");
+  }
+
+  digitalWrite(RELAY_PIN, LOW);
+  Serial.println("Da du nuoc -> Tat bom");
+  delay(2000);
+}
+
+// ===== Nha thuc an bang servo =====
+void dispenseFood() {
+  Serial.println("Thuc an thap -> Nha them...");
+  lcd.setCursor(0, 1);
+  lcd.print("Dang nha thuc an... ");
+
+  myServo.write(90);
+  delay(1500);
+  myServo.write(0);
+  delay(1000);
+
+  Serial.println("Da nha thuc an");
+  delay(2000);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // Water sensor
+  pinMode(WATER_SENSOR_VCC_PIN, OUTPUT);
+  digitalWrite(WATER_SENSOR_VCC_PIN, LOW);
+
+  // Relay
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+
+  // Servo
+  myServo.attach(SERVO_PIN);
+  myServo.write(0);
+
+  // Load cell
+  scale.begin(DOUT_PIN, SCK_PIN);
+  scale.set_scale(SCALE_FACTOR);
+  scale.tare();
+
+  // LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Pet Feeder IOT");
+  lcd.setCursor(0, 1);
+  lcd.print("Dang khoi dong...");
+  delay(1500);
+
+  Serial.println("=== Pet Feeder IOT - San sang ===");
+}
+
+void loop() {
+  Serial.println("========================");
+
+  int waterPct = readWaterLevel();
+  Serial.print("Muc nuoc: ");
+  Serial.print(waterPct);
+  Serial.println("%");
+
+  float foodGram = readFoodWeight();
+  Serial.print("Thuc an: ");
+  Serial.print(foodGram);
+  Serial.println("g");
+
+  updateLCD(waterPct, foodGram, "Trang thai: OK");
+
+  if (waterPct < WATER_LOW_PCT) {
+    pumpWater();
+  }
+
+  if (foodGram >= 0 && foodGram < FOOD_LOW_GRAM) {
+    dispenseFood();
+  }
+
+  Serial.println("Cho 1 phut...");
+  delay(60000);
+}
