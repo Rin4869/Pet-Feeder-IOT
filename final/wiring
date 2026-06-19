@@ -8,6 +8,6 @@ SDA -	GPIO 21
 SCL	- GPIO 22
 
 -Water sensor-
-Water Sensor	S (Signal)	GPIO 36
-Water Sensor	VCC (+)	GPIO 32
-Water Sensor	GND (-)	GND (Rail -)
+S (Signal)	GPIO 36
+VCC (+)	GPIO 32
+GND (-)	GND (Rail -)
