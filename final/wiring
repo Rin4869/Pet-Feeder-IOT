@@ -25,3 +25,8 @@ NC	Not Used
 -Water Pump-
 Positive (+)	Relay NO
 Negative (-)	GND (Rail -)
+
+-Servo-
+Red (VCC)	- (Rail +)
+Brown/Black (GND) -	GND (Rail -)
+Yellow/Orange (Signal) -	GPIO 13
