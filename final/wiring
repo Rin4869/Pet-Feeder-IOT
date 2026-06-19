@@ -1,5 +1,7 @@
--ESP32-
-GND - raid (-)
+-Power-
+Adapter 5V (+)	Rail +
+Adapter GND (-)	Rail -
+ESP32 GND	Rail -
 
 -LCD-
 VCC - Rail +
