@@ -27,7 +27,7 @@
 
 HX711 scale;
 Servo myServo;
-LiquidCrystal_I2C lcd(0x3F, 16, 2);  // doi thanh 0x3F neu khong hien thi
+LiquidCrystal_I2C lcd(0x3F, 16, 2);  
 
 // ===== Doc muc nuoc (%) =====
 int readWaterLevel() {
