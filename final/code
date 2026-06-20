@@ -24,10 +24,11 @@
 #define WATER_HIGH_PCT  70
 #define FOOD_LOW_GRAM   50
 #define SCALE_FACTOR    400.0  // chinh lai sau khi calibrate
+#define PUMP_MAX_ATTEMPTS 20   // toi da ~10s bom, tranh ket vong lap
 
 HX711 scale;
 Servo myServo;
-LiquidCrystal_I2C lcd(0x3F, 16, 2);  
+LiquidCrystal_I2C lcd(0x3F, 16, 2);
 
 // ===== Doc muc nuoc (%) =====
 int readWaterLevel() {
@@ -58,25 +59,36 @@ void updateLCD(int waterPct, float foodGram, String status) {
   lcd.print(status);
 }
 
-// ===== Bom nuoc cho den khi dat nguong =====
+// ===== Bom nuoc cho den khi dat nguong (co gioi han thoi gian) =====
 void pumpWater() {
   Serial.println("Nuoc thap -> Bat bom...");
   lcd.setCursor(0, 1);
   lcd.print("Dang bom nuoc...   ");
 
   int pct = readWaterLevel();
-  while (pct < WATER_HIGH_PCT) {
+  int attempts = 0;
+
+  while (pct < WATER_HIGH_PCT && attempts < PUMP_MAX_ATTEMPTS) {
     digitalWrite(RELAY_PIN, HIGH);
     delay(500);
     pct = readWaterLevel();
     Serial.print("Dang bom... Muc nuoc: ");
     Serial.print(pct);
     Serial.println("%");
+    attempts++;
   }
 
   digitalWrite(RELAY_PIN, LOW);
-  Serial.println("Da du nuoc -> Tat bom");
-  delay(2000);
+
+  if (attempts >= PUMP_MAX_ATTEMPTS) {
+    Serial.println("Canh bao: Bom qua lau, dung de tranh tran nuoc");
+    lcd.setCursor(0, 1);
+    lcd.print("Loi: kiem tra bom! ");
+    delay(1500);
+  } else {
+    Serial.println("Da du nuoc -> Tat bom");
+  }
+  delay(1000);
 }
 
 // ===== Nha thuc an bang servo =====
@@ -91,7 +103,7 @@ void dispenseFood() {
   delay(1000);
 
   Serial.println("Da nha thuc an");
-  delay(2000);
+  delay(1000);
 }
 
 void setup() {
@@ -115,7 +127,7 @@ void setup() {
   scale.set_scale(SCALE_FACTOR);
   scale.tare();
 
-  // LCD
+  // LCD - hien thi ngay khi khoi dong
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0);
@@ -130,25 +142,34 @@ void setup() {
 void loop() {
   Serial.println("========================");
 
+  // 1. Doc sensor va hien thi LCD NGAY LAP TUC (uu tien)
   int waterPct = readWaterLevel();
+  float foodGram = readFoodWeight();
+
   Serial.print("Muc nuoc: ");
   Serial.print(waterPct);
   Serial.println("%");
-
-  float foodGram = readFoodWeight();
   Serial.print("Thuc an: ");
   Serial.print(foodGram);
   Serial.println("g");
 
-  updateLCD(waterPct, foodGram, "Trang thai: OK");
+  updateLCD(waterPct, foodGram, "Dang kiem tra...");
+  delay(800); // cho nguoi xem kip doc man hinh
 
+  // 2. Xu ly bom nuoc neu can (LCD tu cap nhat trang thai ben trong)
   if (waterPct < WATER_LOW_PCT) {
     pumpWater();
   }
 
+  // 3. Xu ly nha thuc an neu can (LCD tu cap nhat trang thai ben trong)
   if (foodGram >= 0 && foodGram < FOOD_LOW_GRAM) {
     dispenseFood();
   }
+
+  // 4. Hien thi trang thai cuoi cung sau khi xu ly xong
+  waterPct = readWaterLevel();
+  foodGram = readFoodWeight();
+  updateLCD(waterPct, foodGram, "OK - San sang");
 
   Serial.println("Cho 1 phut...");
   delay(60000);
