@@ -18,8 +18,8 @@
 #define SERVO_PIN 13
 
 // ===== Nguong =====
-#define WATER_MIN       100
-#define WATER_MAX       3000
+#define WATER_MIN       120
+#define WATER_MAX      1300
 #define WATER_LOW_PCT   30
 #define WATER_HIGH_PCT  70
 #define FOOD_LOW_GRAM   50
