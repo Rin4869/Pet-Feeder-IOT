@@ -5,8 +5,8 @@
 #include <WiFi.h>
 #include <BlynkSimpleEsp32.h>
 
-#define BLYNK_TEMPLATE_ID "YOUR_TEMPLATE_ID"
-#define BLYNK_TEMPLATE_NAME "Pet Feeder"
+#define BLYNK_TEMPLATE_ID "TMPL6rUaYY6fd"
+#define BLYNK_TEMPLATE_NAME "Pet Feeder IoT"
 #define BLYNK_AUTH_TOKEN "mrrMPTYHP2D0h1Z8wBNvKC_Wg1AbPjML"
 
 char ssid[] = "";
