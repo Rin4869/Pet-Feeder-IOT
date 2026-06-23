@@ -176,6 +176,6 @@ void loop() {
   foodGram = readFoodWeight();
   updateLCD(waterPct, foodGram, "");
 
-  Serial.println("Waiting 1 minute...");
-  delay(60000);
+  Serial.println("Waiting 10s minute...");
+  delay(10000);
 }
