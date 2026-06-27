@@ -68,6 +68,7 @@ void updateLCD(int waterPct, float foodGram, String status) {
 // ===== Bom nuoc =====
 void pumpWater() {
   Serial.println("Low Water -> Start Pump");
+  Blynk.logEvent("water_low");
   Blynk.virtualWrite(V3, "Refilling Water");
   lcd.setCursor(0, 1);
   lcd.print("Refilling Water ");
@@ -77,6 +78,7 @@ void pumpWater() {
 
   while (pct < WATER_HIGH_PCT && attempts < PUMP_MAX_ATTEMPTS) {
     digitalWrite(RELAY_PIN, HIGH);
+    Blynk.virtualWrite(V5, "ON");
     Blynk.run(); // giu ket noi blynk trong luc bom
     delay(500);
     pct = readWaterLevel();
@@ -87,6 +89,7 @@ void pumpWater() {
   }
 
   digitalWrite(RELAY_PIN, LOW);
+  Blynk.virtualWrite(V5, "OFF");
 
   if (attempts >= PUMP_MAX_ATTEMPTS) {
     Serial.println("Warning: Pump Timeout");
@@ -98,11 +101,13 @@ void pumpWater() {
     Serial.println("Water Full -> Stop Pump");
   }
   delay(1000);
+  Blynk.virtualWrite(V8, "Just Now");
 }
 
 // ===== Nha thuc an =====
 void dispenseFood() {
   Serial.println("Low Food -> Dispensing");
+  Blynk.logEvent("food_low");
   Blynk.virtualWrite(V3, "Dispensing Food");
   lcd.setCursor(0, 1);
   lcd.print("Dispensing Food ");
@@ -114,6 +119,7 @@ void dispenseFood() {
   delay(1000);
 
   Serial.println("Food Dispensed");
+  Blynk.virtualWrite(V7, "Just Now");
   delay(1000);
 }
 
@@ -125,13 +131,21 @@ BLYNK_WRITE(V2) {
 }
 
 // ===== Blynk: nut bam bom thu cong (V4) =====
-BLYNK_WRITE(V4) {
-  if (param.asInt() == 1) {
+BLYNK_WRITE(V4)
+{
+  if (param.asInt())
+  {
     digitalWrite(RELAY_PIN, HIGH);
-    Blynk.virtualWrite(V3, "Manual Pump ON");
-  } else {
+
+    Blynk.virtualWrite(V3, "Manual Pump");
+    Blynk.virtualWrite(V5, "ON");
+  }
+  else
+  {
     digitalWrite(RELAY_PIN, LOW);
-    Blynk.virtualWrite(V3, "Manual Pump OFF");
+
+    Blynk.virtualWrite(V3, "Monitoring");
+    Blynk.virtualWrite(V5, "OFF");
   }
 }
 
@@ -147,6 +161,7 @@ void checkAndUpdate() {
 
   Blynk.virtualWrite(V0, waterPct);
   Blynk.virtualWrite(V1, foodGram);
+  Blynk.virtualWrite(V6, "🟢 Online");
 
   updateLCD(waterPct, foodGram, "Monitoring...");
 
@@ -195,6 +210,11 @@ void setup() {
 
   // Blynk
   Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+  Blynk.virtualWrite(V6, "🟢 Online");
+  Blynk.virtualWrite(V5, "OFF");
+  Blynk.virtualWrite(V7, "--:--");
+  Blynk.virtualWrite(V8, "--:--");
+  Blynk.logEvent("device_online");
 
   lcd.clear();
   lcd.setCursor(0, 0);
