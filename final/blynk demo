@@ -2,17 +2,19 @@
 #define BLYNK_TEMPLATE_NAME "Pet Feeder IoT"
 #define BLYNK_AUTH_TOKEN "mrrMPTYHP2D0h1Z8wBNvKC_Wg1AbPjML"
 
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 #include <HX711.h>
 #include <ESP32Servo.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <WiFi.h>
 #include <BlynkSimpleEsp32.h>
+#include <time.h>
 
-char ssid[] = "Nhất Định";   // ← điền vào
-char pass[] = "09022006";       // ← điền vào
+char ssid[] = "Nhất Định";
+char pass[] = "09022006";
 
-// ===== Pin definitions =====
 #define DOUT_PIN             23
 #define SCK_PIN              14
 #define WATER_SENSOR_PIN     36
@@ -20,7 +22,6 @@ char pass[] = "09022006";       // ← điền vào
 #define RELAY_PIN            25
 #define SERVO_PIN            13
 
-// ===== Nguong =====
 #define WATER_MIN         120
 #define WATER_MAX         1300
 #define WATER_LOW_PCT     30
@@ -34,13 +35,44 @@ Servo myServo;
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 BlynkTimer timer;
 
+bool shouldFeed     = false;
+bool waterEventSent = false;
+bool foodEventSent  = false;
+
+int feedCountToday   = 0;
+int refillCountToday = 0;
+String lastDate      = "";
+
+// ===== Lay thoi gian hien tai dang chuan =====
+String getCurrentTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "--:--";
+  char buf[20];
+  strftime(buf, sizeof(buf), "%H:%M %d/%m/%Y", &timeinfo);
+  return String(buf);
+}
+
+// ===== Kiem tra ngay moi =====
+void checkNewDay() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+  char today[12];
+  strftime(today, sizeof(today), "%d/%m/%Y", &timeinfo);
+  if (String(today) != lastDate) {
+    feedCountToday   = 0;
+    refillCountToday = 0;
+    lastDate         = String(today);
+    Serial.println(F("New day - reset counters"));
+  }
+}
+
 // ===== Doc muc nuoc (%) =====
 int readWaterLevel() {
   digitalWrite(WATER_SENSOR_VCC_PIN, HIGH);
   delay(100);
   int raw = analogRead(WATER_SENSOR_PIN);
   digitalWrite(WATER_SENSOR_VCC_PIN, LOW);
-  Serial.print("RAW water: ");
+  Serial.print(F("RAW water: "));
   Serial.println(raw);
   int pct = map(raw, WATER_MIN, WATER_MAX, 0, 100);
   return constrain(pct, 0, 100);
@@ -49,187 +81,220 @@ int readWaterLevel() {
 // ===== Doc trong luong thuc an =====
 float readFoodWeight() {
   if (!scale.is_ready()) return -1;
-  return scale.get_units(10);
+  return scale.get_units(5);
 }
 
 // ===== Hien thi LCD =====
-void updateLCD(int waterPct, float foodGram, String status) {
+// Dong 1: gio thuc (HH:MM DD/MM/YYYY)
+// Dong 2: status
+void updateLCD(int waterPct, float foodGram, const char* status) {
+  struct tm timeinfo;
+  char timeBuf[17] = "--:-- --/--/----";
+
+  if (getLocalTime(&timeinfo)) {
+    strftime(timeBuf, sizeof(timeBuf), "%H:%M %d/%m/%Y", &timeinfo);
+  }
+
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("F:");
-  lcd.print((int)foodGram);
-  lcd.print("g W:");
-  lcd.print(waterPct);
-  lcd.print("%");
+  lcd.print(timeBuf);
   lcd.setCursor(0, 1);
   lcd.print(status);
 }
 
 // ===== Bom nuoc =====
 void pumpWater() {
-  Serial.println("Low Water -> Start Pump");
-  Blynk.logEvent("water_low");
-  Blynk.virtualWrite(V3, "Refilling Water");
-  lcd.setCursor(0, 1);
-  lcd.print("Refilling Water ");
+  Serial.println(F("Low Water -> Start Pump"));
+  Blynk.virtualWrite(V3, F("Refilling Water"));
+  updateLCD(0, 0, "Refilling Water ");
 
-  int pct = readWaterLevel();
+  int pct      = readWaterLevel();
   int attempts = 0;
 
   while (pct < WATER_HIGH_PCT && attempts < PUMP_MAX_ATTEMPTS) {
     digitalWrite(RELAY_PIN, HIGH);
-    Blynk.virtualWrite(V5, "ON");
-    Blynk.run(); // giu ket noi blynk trong luc bom
+    Blynk.virtualWrite(V5, F("ON"));
+    Blynk.run();
+    yield();
     delay(500);
     pct = readWaterLevel();
-    Serial.print("Pumping... Water: ");
+    Serial.print(F("Pumping... Water: "));
     Serial.print(pct);
-    Serial.println("%");
+    Serial.println(F("%"));
     attempts++;
   }
 
   digitalWrite(RELAY_PIN, LOW);
-  Blynk.virtualWrite(V5, "OFF");
+  Blynk.virtualWrite(V5, F("OFF"));
 
   if (attempts >= PUMP_MAX_ATTEMPTS) {
-    Serial.println("Warning: Pump Timeout");
-    Blynk.virtualWrite(V3, "Check Pump!");
-    lcd.setCursor(0, 1);
-    lcd.print("Check Pump!     ");
+    Serial.println(F("Warning: Pump Timeout"));
+    Blynk.virtualWrite(V3, F("Check Pump!"));
+    updateLCD(0, 0, "Check Pump!     ");
     delay(1500);
   } else {
-    Serial.println("Water Full -> Stop Pump");
+    Serial.println(F("Water Full -> Stop Pump"));
+    refillCountToday++;
   }
+
+  String t = getCurrentTime();
+  Blynk.virtualWrite(V8, t);
+  Serial.print(F("Last Refill: "));
+  Serial.println(t);
+
   delay(1000);
-  Blynk.virtualWrite(V8, "Just Now");
 }
 
 // ===== Nha thuc an =====
 void dispenseFood() {
-  Serial.println("Low Food -> Dispensing");
-  Blynk.logEvent("food_low");
-  Blynk.virtualWrite(V3, "Dispensing Food");
-  lcd.setCursor(0, 1);
-  lcd.print("Dispensing Food ");
+  Serial.println(F("Dispensing Food..."));
+  Blynk.virtualWrite(V3, F("Dispensing Food"));
+  updateLCD(0, 0, "Dispensing Food ");
 
   myServo.write(90);
   Blynk.run();
+  yield();
   delay(1500);
   myServo.write(0);
   delay(1000);
 
-  Serial.println("Food Dispensed");
-  Blynk.virtualWrite(V7, "Just Now");
+  feedCountToday++;
+
+  String t = getCurrentTime();
+  Blynk.virtualWrite(V7, t);
+  Serial.print(F("Last Feed: "));
+  Serial.println(t);
+
   delay(1000);
 }
 
-// ===== Blynk: nut bam servo thu cong (V2) =====
+// ===== Blynk callbacks =====
 BLYNK_WRITE(V2) {
   if (param.asInt() == 1) {
-    dispenseFood();
+    shouldFeed = true;
   }
 }
 
-// ===== Blynk: nut bam bom thu cong (V4) =====
-BLYNK_WRITE(V4)
-{
-  if (param.asInt())
-  {
+BLYNK_WRITE(V4) {
+  if (param.asInt()) {
     digitalWrite(RELAY_PIN, HIGH);
-
-    Blynk.virtualWrite(V3, "Manual Pump");
-    Blynk.virtualWrite(V5, "ON");
-  }
-  else
-  {
+    Blynk.virtualWrite(V3, F("Manual Pump ON"));
+    Blynk.virtualWrite(V5, F("ON"));
+  } else {
     digitalWrite(RELAY_PIN, LOW);
-
-    Blynk.virtualWrite(V3, "Monitoring");
-    Blynk.virtualWrite(V5, "OFF");
+    Blynk.virtualWrite(V3, F("Monitoring"));
+    Blynk.virtualWrite(V5, F("OFF"));
   }
 }
 
-// ===== Ham chay dinh ky (thay cho delay 60s) =====
+// ===== Ham chay dinh ky =====
 void checkAndUpdate() {
-  Serial.println("========================");
+  Serial.println(F("========================"));
 
-  int waterPct = readWaterLevel();
+  checkNewDay();
+
+  int waterPct   = readWaterLevel();
   float foodGram = readFoodWeight();
 
-  Serial.print("Water: "); Serial.print(waterPct); Serial.println("%");
-  Serial.print("Food: "); Serial.print(foodGram); Serial.println("g");
+  Serial.print(F("Water: ")); Serial.print(waterPct); Serial.println(F("%"));
+  Serial.print(F("Food: ")); Serial.print(foodGram); Serial.println(F("g"));
+  Serial.print(F("Feed today: ")); Serial.println(feedCountToday);
+  Serial.print(F("Refill today: ")); Serial.println(refillCountToday);
 
   Blynk.virtualWrite(V0, waterPct);
   Blynk.virtualWrite(V1, foodGram);
-  Blynk.virtualWrite(V6, "🟢 Online");
+  Blynk.virtualWrite(V6, F("Online"));
 
   updateLCD(waterPct, foodGram, "Monitoring...");
 
   if (waterPct < WATER_LOW_PCT) {
+    if (!waterEventSent) {
+      Blynk.logEvent("water_low");
+      waterEventSent = true;
+    }
     pumpWater();
+  } else {
+    waterEventSent = false;
   }
 
   if (foodGram >= 0 && foodGram < FOOD_LOW_GRAM) {
+    if (!foodEventSent) {
+      Blynk.logEvent("food_low");
+      foodEventSent = true;
+    }
     dispenseFood();
+  } else {
+    foodEventSent = false;
   }
 
   waterPct = readWaterLevel();
   foodGram = readFoodWeight();
   updateLCD(waterPct, foodGram, "OK - Ready");
-  Blynk.virtualWrite(V3, "Monitoring");
+  Blynk.virtualWrite(V3, F("Monitoring"));
 }
 
 void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
   Serial.begin(115200);
   delay(500);
 
-  // Water sensor
   pinMode(WATER_SENSOR_VCC_PIN, OUTPUT);
   digitalWrite(WATER_SENSOR_VCC_PIN, LOW);
 
-  // Relay
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
 
-  // Servo
   myServo.attach(SERVO_PIN);
   myServo.write(0);
 
-  // Load cell
   scale.begin(DOUT_PIN, SCK_PIN);
   scale.set_scale(SCALE_FACTOR);
   scale.tare();
 
-  // LCD
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0);
-  lcd.print("Pet Feeder IoT");
+  lcd.print(F("Pet Feeder IoT"));
   lcd.setCursor(0, 1);
-  lcd.print("Connecting...");
+  lcd.print(F("Connecting..."));
 
-  // Blynk
   Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
-  Blynk.virtualWrite(V6, "🟢 Online");
-  Blynk.virtualWrite(V5, "OFF");
-  Blynk.virtualWrite(V7, "--:--");
-  Blynk.virtualWrite(V8, "--:--");
-  Blynk.logEvent("device_online");
+
+  configTime(7 * 3600, 0, "pool.ntp.org");
+  Serial.println(F("Syncing time..."));
+  delay(2000);
+
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    char today[12];
+    strftime(today, sizeof(today), "%d/%m/%Y", &timeinfo);
+    lastDate = String(today);
+  }
+
+  Blynk.virtualWrite(V6, F("Online"));
+  Blynk.virtualWrite(V5, F("OFF"));
+  Blynk.virtualWrite(V7, F("--"));
+  Blynk.virtualWrite(V8, F("--"));
 
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("Pet Feeder IoT");
+  lcd.print(F("Pet Feeder IoT"));
   lcd.setCursor(0, 1);
-  lcd.print("Ready!");
+  lcd.print(F("Ready!"));
   delay(1000);
 
-  // Timer chay moi 60 giay, khong block Blynk.run()
   timer.setInterval(60000L, checkAndUpdate);
 
-  Serial.println("=== Pet Feeder IoT Ready ===");
+  Serial.println(F("=== Pet Feeder IoT Ready ==="));
 }
 
 void loop() {
   Blynk.run();
   timer.run();
+
+  if (shouldFeed) {
+    shouldFeed = false;
+    dispenseFood();
+  }
 }
