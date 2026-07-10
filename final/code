@@ -16,8 +16,8 @@
 #include <time.h>
 
 // ===== Firebase =====
-#define FIREBASE_API_KEY  "YOUR_API_KEY"
-#define FIREBASE_DB_URL   "YOUR_DB_URL"
+#define FIREBASE_API_KEY  "AIzaSyD9aDCvRZAId21oBYgoG9cIo8PzjtMq0ow"
+#define FIREBASE_DB_URL   "https://pet-feeder-a9136-default-rtdb.firebaseio.com"
 
 // ===== Pins =====
 #define DOUT_PIN             23
