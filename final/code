@@ -457,12 +457,20 @@ void setup() {
   delay(2000);
 
   // ===== Firebase =====
-  fbConfig.api_key      = FIREBASE_API_KEY;
-  fbConfig.database_url = FIREBASE_DB_URL;
-  Firebase.signupAnonymously(&fbConfig, &fbAuth);
-  fbConfig.token_status_callback = tokenStatusCallback;
-  Firebase.begin(&fbConfig, &fbAuth);
-  Firebase.reconnectWiFi(true);
+fbConfig.api_key = FIREBASE_API_KEY;
+fbConfig.database_url = FIREBASE_DB_URL;
+
+fbConfig.token_status_callback = tokenStatusCallback;
+
+if (Firebase.signUp(&fbConfig, &fbAuth, "", "")) {
+  Serial.println("Firebase sign up OK");
+} else {
+  Serial.printf("Firebase sign up failed: %s\n",
+                fbConfig.signer.signupError.message.c_str());
+}
+
+Firebase.begin(&fbConfig, &fbAuth);
+Firebase.reconnectWiFi(true);
 
   // Load active profile
   if (Firebase.RTDB.getString(&fbdo, "/activeProfile")) {
