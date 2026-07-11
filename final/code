@@ -15,27 +15,36 @@
 #include <addons/TokenHelper.h>
 #include <time.h>
 
-// ===== Firebase =====
-#define FIREBASE_API_KEY  "AIzaSyD9aDCvRZAId21oBYgoG9cIo8PzjtMq0ow"
-#define FIREBASE_DB_URL   "https://pet-feeder-a9136-default-rtdb.firebaseio.com"
+#define FIREBASE_API_KEY "AIzaSyD9aDCvRZAId21oBYgoG9cIo8PzjtMq0ow"
+#define FIREBASE_DB_URL  "https://pet-feeder-a9136-default-rtdb.firebaseio.com"
 
-// ===== Pins =====
 #define DOUT_PIN             23
 #define SCK_PIN              14
 #define WATER_SENSOR_PIN     36
 #define WATER_SENSOR_VCC_PIN 32
 #define RELAY_PIN            25
 #define SERVO_PIN            13
-#define RESET_PIN             0  // nut BOOT ESP32
+#define RESET_PIN             0
 
-// ===== Sensor calibration =====
-#define WATER_MIN  120
-#define WATER_MAX  1300
-#define SCALE_FACTOR 400.0
+#define WATER_MIN         120
+#define WATER_MAX         1300
+#define SCALE_FACTOR      400.0
+#define PUMP_MAX_ATTEMPTS  20
+#define NO_RISE_LIMIT       3
+#define DISPENSE_SAFETY    20
+#define SETTLE_DELAY_MS   800
+#define NO_CHANGE_LIMIT     3
+#define LCD_WIDTH          16
 
-// ===== Pump =====
-#define PUMP_MAX_ATTEMPTS 20
-#define NO_RISE_LIMIT      3
+// ===== State Machine =====
+// STATE_ERROR da duoc xu ly day du, giu lai
+enum SystemState {
+  STATE_IDLE,
+  STATE_DISPENSING,
+  STATE_PUMPING,
+  STATE_ERROR
+};
+SystemState currentState = STATE_IDLE;
 
 // ===== Objects =====
 HX711 scale;
@@ -46,17 +55,23 @@ FirebaseData fbdo;
 FirebaseAuth fbAuth;
 FirebaseConfig fbConfig;
 
-// ===== Pet Profile (load tu Firebase) =====
-String activePetName    = "Default";
-String activeProfileId  = "1";
-int    foodTargetGram   = 50;
-int    waterLowPct      = 30;
-int    waterRefillPct   = 70;
+// ===== Pet Profile =====
+struct PetProfile {
+  String name        = "Default";
+  int foodLowGram    = 20;
+  int foodTargetGram = 70;
+  int waterLow       = 30;
+  int waterRefill    = 70;
+};
+PetProfile activeProfile;
+String activeProfileId = "";
 
 // ===== Flags =====
-bool shouldFeed      = false;
-bool waterEventSent  = false;
-bool foodEventSent   = false;
+bool shouldFeed     = false;
+bool isDispensing   = false;
+bool isPumping      = false;
+bool waterEventSent = false;
+bool foodEventSent  = false;
 
 // ===== Counters =====
 int    feedCountToday    = 0;
@@ -64,10 +79,10 @@ int    refillCountToday  = 0;
 String lastDate          = "";
 float  foodWeightMorning = -1;
 
-// ===== Manual pump detect =====
-int           manualLastPct    = 0;
-int           manualNoRise     = 0;
-unsigned long manualLastCheck  = 0;
+// ===== Manual pump =====
+int           manualLastPct   = 0;
+int           manualNoRise    = 0;
+unsigned long manualLastCheck = 0;
 
 // ===================================================
 // UTILITIES
@@ -81,16 +96,50 @@ String getCurrentTime() {
   return String(buf);
 }
 
-void updateLCD(const char* status) {
-  struct tm t;
-  char timeBuf[17] = "--:-- --/--/----";
-  if (getLocalTime(&t))
-    strftime(timeBuf, sizeof(timeBuf), "%H:%M %d/%m/%Y", &t);
-  lcd.clear();
+// Gioi han chuoi 16 ky tu, tranh tran LCD
+String truncate(String s) {
+  if (s.length() > LCD_WIDTH) s = s.substring(0, LCD_WIDTH);
+  while (s.length() < LCD_WIDTH) s += ' ';
+  return s;
+}
+
+void setLCDLine0(const char* text) {
   lcd.setCursor(0, 0);
-  lcd.print(timeBuf);
+  lcd.print(truncate(String(text)));
+}
+
+void setLCDLine1(const char* text) {
   lcd.setCursor(0, 1);
-  lcd.print(status);
+  lcd.print(truncate(String(text)));
+}
+
+void updateLCDTime() {
+  if (currentState != STATE_IDLE) return;
+  struct tm t;
+  char buf[17] = "--:-- --/--/----";
+  if (getLocalTime(&t))
+    strftime(buf, sizeof(buf), "%H:%M %d/%m/%Y", &t);
+  setLCDLine0(buf);
+}
+
+void resetToIdle(const char* lcdMsg = "OK - Ready") {
+  currentState = STATE_IDLE;
+  isDispensing = false;
+  isPumping    = false;
+  Blynk.virtualWrite(V3, F("Monitoring"));
+  setLCDLine1(lcdMsg);
+}
+
+// STATE_ERROR: hien thi loi, cho den khi user reset
+void enterErrorState(const char* reason) {
+  currentState = STATE_ERROR;
+  isDispensing = false;
+  isPumping    = false;
+  digitalWrite(RELAY_PIN, LOW);
+  myServo.write(0);
+  Blynk.virtualWrite(V3, reason);
+  setLCDLine1(reason);
+  // Blynk se tiep tuc chay, user co the reset bang cach chon lai profile
 }
 
 // ===================================================
@@ -102,99 +151,188 @@ int readWaterLevel() {
   delay(100);
   int raw = analogRead(WATER_SENSOR_PIN);
   digitalWrite(WATER_SENSOR_VCC_PIN, LOW);
-  Serial.print(F("RAW water: "));
-  Serial.println(raw);
   return constrain(map(raw, WATER_MIN, WATER_MAX, 0, 100), 0, 100);
 }
 
 float readFoodWeight() {
   if (!scale.is_ready()) return -1;
-  return scale.get_units(5);
+  float w = scale.get_units(5);
+  if (isnan(w)) return -1;
+  return w;
 }
 
 // ===================================================
-// FIREBASE — LOAD PROFILE
+// FIREBASE — doc JSON 1 lan thay vi nhieu request
 // ===================================================
 
 void loadProfile(String profileId) {
-  String base = "/profiles/" + profileId;
-  if (Firebase.RTDB.getInt(&fbdo,    base + "/foodTarget"))  foodTargetGram  = fbdo.intData();
-  if (Firebase.RTDB.getInt(&fbdo,    base + "/waterLow"))    waterLowPct     = fbdo.intData();
-  if (Firebase.RTDB.getInt(&fbdo,    base + "/waterRefill")) waterRefillPct  = fbdo.intData();
-  if (Firebase.RTDB.getString(&fbdo, base + "/name"))        activePetName   = fbdo.stringData();
+  if (profileId == activeProfileId && activeProfile.name != "Default") return;
 
-  activeProfileId = profileId;
+  String base = "/profiles/" + profileId;
+
+  // Doc tat ca truoc, neu that bai khong ap dung
+  String  newName    = activeProfile.name;
+  int     newFoodLow = activeProfile.foodLowGram;
+  int     newFoodTgt = activeProfile.foodTargetGram;
+  int     newWatLow  = activeProfile.waterLow;
+  int     newWatFill = activeProfile.waterRefill;
+  bool    ok         = true;
+
+  if (Firebase.RTDB.getString(&fbdo, base + "/name"))
+    newName = fbdo.stringData();
+  else ok = false;
+
+  if (ok && Firebase.RTDB.getInt(&fbdo, base + "/foodLow"))
+    newFoodLow = fbdo.intData();
+  else ok = false;
+
+  if (ok && Firebase.RTDB.getInt(&fbdo, base + "/foodTarget"))
+    newFoodTgt = fbdo.intData();
+  else ok = false;
+
+  if (ok && Firebase.RTDB.getInt(&fbdo, base + "/waterLow"))
+    newWatLow = fbdo.intData();
+  else ok = false;
+
+  if (ok && Firebase.RTDB.getInt(&fbdo, base + "/waterRefill"))
+    newWatFill = fbdo.intData();
+  else ok = false;
+
+  // Chi ap dung khi doc thanh cong tat ca
+  if (!ok) {
+    Blynk.virtualWrite(V3, F("Profile load fail"));
+    setLCDLine1("Profile Error   ");
+    return;
+  }
+
+  activeProfile.name         = newName;
+  activeProfile.foodLowGram  = newFoodLow;
+  activeProfile.foodTargetGram = newFoodTgt;
+  activeProfile.waterLow     = newWatLow;
+  activeProfile.waterRefill  = newWatFill;
+  activeProfileId            = profileId;
+
   Firebase.RTDB.setString(&fbdo, "/activeProfile", profileId);
 
-  Serial.print(F("Profile: ")); Serial.println(activePetName);
-  Serial.print(F("Food: "));    Serial.println(foodTargetGram);
-  Serial.print(F("WaterLow: ")); Serial.println(waterLowPct);
-  Serial.print(F("WaterFill: ")); Serial.println(waterRefillPct);
+  // Cap nhat ngay sau khi load
+  updateLCDTime();
+  setLCDLine1(("Pet: " + activeProfile.name).c_str());
+  Blynk.virtualWrite(V3, ("Pet: " + activeProfile.name).c_str());
 
-  Blynk.virtualWrite(V3, ("Pet: " + activePetName).c_str());
-  updateLCD(("Pet: " + activePetName).c_str());
+  // Gợi y: cap nhat sensor ngay sau khi doi profile
+  int   w = readWaterLevel();
+  float f = readFoodWeight();
+  Blynk.virtualWrite(V0, w);
+  if (f >= 0) Blynk.virtualWrite(V1, f);
+}
+
+void syncLogs() {
+  Firebase.RTDB.setInt(&fbdo, "/logs/feedToday",   feedCountToday);
+  Firebase.RTDB.setInt(&fbdo, "/logs/refillToday", refillCountToday);
 }
 
 // ===================================================
-// DISPENSE FOOD — nhả đúng khẩu phần
+// DISPENSE FOOD
 // ===================================================
 
 void dispenseFood() {
-  Serial.println(F("Dispensing Food..."));
-  Blynk.virtualWrite(V3, F("Dispensing Food"));
-  updateLCD("Dispensing Food ");
+  if (isDispensing || isPumping) return;
+  if (currentState == STATE_ERROR) return; // khong nha khi dang loi
 
   float before = readFoodWeight();
-  if (before < 0) before = 0;
+  if (before < 0) {
+    Blynk.logEvent("sensor_error", "Load cell error, cannot dispense.");
+    enterErrorState("Sensor Error!");
+    return;
+  }
 
-  float dispensed  = 0;
-  int   safetyLoop = 0;
+  float target = activeProfile.foodTargetGram - before;
+  if (target <= 0) {
+    Blynk.virtualWrite(V3, F("Food sufficient"));
+    setLCDLine1("Food OK");
+    return;
+  }
 
-  // Mo servo tung dot ngan cho den khi du luong
-  while (dispensed < foodTargetGram && safetyLoop < 20) {
+  isDispensing = true;
+  currentState = STATE_DISPENSING;
+  Blynk.virtualWrite(V3, F("Dispensing..."));
+  setLCDLine1("Dispensing...");
+
+  float dispensed     = 0;
+  float lastDispensed = 0;
+  int   safetyLoop    = 0;
+  int   noChangeCount = 0;
+  bool  jammed        = false;
+
+  while (dispensed < target && safetyLoop < DISPENSE_SAFETY) {
     myServo.write(90);
     Blynk.run();
     yield();
-    delay(500);         // mo 0.5s moi dot
+    delay(500);
     myServo.write(0);
-    delay(300);         // cho thuc an roi xuong
+    delay(SETTLE_DELAY_MS);
 
     float current = readFoodWeight();
-    if (current >= 0) dispensed = current - before;
+    if (current < 0) {
+      Blynk.logEvent("sensor_error", "Load cell error during dispensing.");
+      enterErrorState("Sensor Error!");
+      return;
+    }
 
-    Serial.print(F("Dispensed so far: "));
-    Serial.print(dispensed);
-    Serial.println(F("g"));
+    dispensed = current - before;
+
+    if ((dispensed - lastDispensed) < 1.0) {
+      noChangeCount++;
+      if (noChangeCount >= NO_CHANGE_LIMIT) {
+        jammed = true;
+        Blynk.logEvent("food_jam",
+          "Food jam or container empty. Please check the feeder.");
+        break;
+      }
+    } else {
+      noChangeCount = 0;
+    }
+
+    lastDispensed = dispensed;
     safetyLoop++;
   }
 
-  feedCountToday++;
-  String t = getCurrentTime();
-  Blynk.virtualWrite(V7, t);
-  Firebase.RTDB.setString(&fbdo, "/logs/lastFeed", t.c_str());
-  Firebase.RTDB.setInt(&fbdo,    "/logs/feedToday", feedCountToday);
+  myServo.write(0);
 
-  Serial.print(F("Total dispensed: "));
-  Serial.print(dispensed);
-  Serial.println(F("g"));
-  delay(500);
+  if (dispensed > 0) {
+    feedCountToday++;
+    String t = getCurrentTime();
+    Blynk.virtualWrite(V7, t);
+    Firebase.RTDB.setString(&fbdo, "/logs/lastFeed", t.c_str());
+    syncLogs();
+  }
+
+  if (jammed)
+    resetToIdle("Food Jam/Empty!");
+  else
+    resetToIdle(dispensed > 0 ? "OK - Ready" : "Check Feeder!");
 }
 
 // ===================================================
-// PUMP WATER — detect binh nguon can
+// PUMP WATER
 // ===================================================
 
 void pumpWater() {
-  Serial.println(F("Low Water -> Start Pump"));
-  Blynk.virtualWrite(V3, F("Refilling Water"));
-  updateLCD("Refilling Water ");
+  if (isPumping || isDispensing) return;
+  if (currentState == STATE_ERROR) return;
+
+  isPumping    = true;
+  currentState = STATE_PUMPING;
+  Blynk.virtualWrite(V3, F("Refilling..."));
+  setLCDLine1("Refilling...");
 
   int pct         = readWaterLevel();
   int attempts    = 0;
   int noRiseCount = 0;
   int lastPct     = pct;
+  bool sourceEmpty = false;
 
-  while (pct < waterRefillPct && attempts < PUMP_MAX_ATTEMPTS) {
+  while (pct < activeProfile.waterRefill && attempts < PUMP_MAX_ATTEMPTS) {
     digitalWrite(RELAY_PIN, HIGH);
     Blynk.virtualWrite(V5, F("ON"));
     Blynk.run();
@@ -202,18 +340,14 @@ void pumpWater() {
     delay(500);
 
     pct = readWaterLevel();
-    Serial.print(F("Pumping... Water: "));
-    Serial.print(pct); Serial.println(F("%"));
 
-    // Detect binh nguon can
     if (pct <= lastPct) noRiseCount++;
     else                noRiseCount = 0;
 
     if (noRiseCount >= NO_RISE_LIMIT) {
-      Serial.println(F("Source empty! Stop pump."));
-      Blynk.logEvent("source_empty", "Water source is empty! Please refill.");
-      Blynk.virtualWrite(V3, F("Source Empty!"));
-      updateLCD("Source Empty!   ");
+      sourceEmpty = true;
+      Blynk.logEvent("source_empty",
+        "Water source is empty! Please refill.");
       break;
     }
 
@@ -224,33 +358,32 @@ void pumpWater() {
   digitalWrite(RELAY_PIN, LOW);
   Blynk.virtualWrite(V5, F("OFF"));
 
-  if (attempts >= PUMP_MAX_ATTEMPTS) {
-    Blynk.virtualWrite(V3, F("Check Pump!"));
-    updateLCD("Check Pump!     ");
-    delay(1500);
-  } else if (noRiseCount < NO_RISE_LIMIT) {
+  if (sourceEmpty) {
+    resetToIdle("Refill Source!");
+  } else if (attempts >= PUMP_MAX_ATTEMPTS) {
+    resetToIdle("Check Pump!");
+  } else {
     refillCountToday++;
+    String t = getCurrentTime();
+    Blynk.virtualWrite(V8, t);
+    Firebase.RTDB.setString(&fbdo, "/logs/lastRefill", t.c_str());
+    syncLogs();
+    resetToIdle("OK - Ready");
   }
-
-  String t = getCurrentTime();
-  Blynk.virtualWrite(V8, t);
-  Firebase.RTDB.setString(&fbdo, "/logs/lastRefill", t.c_str());
-  Firebase.RTDB.setInt(&fbdo,    "/logs/refillToday", refillCountToday);
-  delay(1000);
 }
 
 // ===================================================
-// MANUAL PUMP DETECT — kiem tra khi bom thu cong
+// MANUAL PUMP DETECT
 // ===================================================
 
 void checkManualPump() {
+  if (currentState != STATE_PUMPING) return;
+  if (!isPumping) return;
   if (digitalRead(RELAY_PIN) == LOW) return;
   if (millis() - manualLastCheck < 1500) return;
   manualLastCheck = millis();
 
   int pct = readWaterLevel();
-  Serial.print(F("Manual pump check: "));
-  Serial.println(pct);
 
   if (pct <= manualLastPct) manualNoRise++;
   else                      manualNoRise = 0;
@@ -261,16 +394,15 @@ void checkManualPump() {
     digitalWrite(RELAY_PIN, LOW);
     Blynk.virtualWrite(V4, 0);
     Blynk.virtualWrite(V5, F("OFF"));
-    Blynk.virtualWrite(V3, F("Source Empty!"));
-    Blynk.logEvent("source_empty", "Water source is empty! Please refill.");
-    updateLCD("Source Empty!   ");
+    Blynk.logEvent("source_empty",
+      "Water source is empty! Please refill.");
     manualNoRise = 0;
-    Serial.println(F("Manual pump: source empty, auto stop"));
+    resetToIdle("Refill Source!");
   }
 }
 
 // ===================================================
-// NEW DAY — canh bao ve sinh bat
+// NEW DAY
 // ===================================================
 
 void checkNewDay() {
@@ -278,37 +410,69 @@ void checkNewDay() {
   if (!getLocalTime(&t)) return;
   char today[12];
   strftime(today, sizeof(today), "%d/%m/%Y", &t);
-
   if (String(today) == lastDate) return;
 
-  // Sang ngay moi
   float currentWeight = readFoodWeight();
 
-  // Neu thuc an giam duoi 20% so voi dau ngay → con thua nhieu
   if (foodWeightMorning > 0 && currentWeight > 0) {
-    float consumed = foodWeightMorning - currentWeight;
-    float ratio    = consumed / foodWeightMorning;
-
-    if (ratio < 0.2) {
-      Serial.println(F("ALERT: Food bowl needs cleaning!"));
+    float ratio = (foodWeightMorning - currentWeight) / foodWeightMorning;
+    if (ratio < 0.2)
       Blynk.logEvent("clean_food_bowl",
-        "Food has not been consumed. Please clean the food bowl.");
-    }
+        "Food not consumed yesterday. Please clean the food bowl.");
   }
 
-  // Canh bao ve sinh bat nuoc (nếu đã bơm nhiều lần mà vẫn cần bơm)
-  if (refillCountToday >= 5) {
+  if (refillCountToday >= 5)
     Blynk.logEvent("clean_water_bowl",
-      "Water bowl has been refilled many times. Please clean it.");
-  }
+      "Water refilled many times. Please clean water bowl.");
 
-  // Reset cho ngay moi
   foodWeightMorning = currentWeight;
   feedCountToday    = 0;
   refillCountToday  = 0;
   lastDate          = String(today);
+}
 
-  Serial.println(F("New day - counters reset"));
+// ===================================================
+// PERIODIC CHECKS
+// ===================================================
+
+void checkFood() {
+  if (currentState == STATE_ERROR) return;
+  float foodGram = readFoodWeight();
+  if (foodGram < 0) return;
+  Blynk.virtualWrite(V1, foodGram);
+
+  if (foodGram < activeProfile.foodLowGram) {
+    if (!foodEventSent) {
+      Blynk.logEvent("food_low", "Food is low, dispensing...");
+      foodEventSent = true;
+    }
+    dispenseFood();
+  } else {
+    foodEventSent = false;
+  }
+}
+
+void checkWater() {
+  if (currentState == STATE_ERROR) return;
+  int waterPct = readWaterLevel();
+  Blynk.virtualWrite(V0, waterPct);
+
+  if (waterPct < activeProfile.waterLow) {
+    if (!waterEventSent) {
+      Blynk.logEvent("water_low", "Water is low, refilling...");
+      waterEventSent = true;
+    }
+    pumpWater();
+  } else {
+    waterEventSent = false;
+  }
+}
+
+void checkAndUpdate() {
+  checkNewDay();
+  Blynk.virtualWrite(V6, F("Online"));
+  checkWater();
+  checkFood();
 }
 
 // ===================================================
@@ -316,78 +480,41 @@ void checkNewDay() {
 // ===================================================
 
 BLYNK_WRITE(V2) {
-  // Nut nha thuc an thu cong
-  if (param.asInt() == 1) shouldFeed = true;
+  if (param.asInt() == 1 && !isDispensing && !isPumping
+      && currentState != STATE_ERROR)
+    shouldFeed = true;
 }
 
 BLYNK_WRITE(V4) {
-  // Switch bom thu cong
+  if (isDispensing || currentState == STATE_ERROR) {
+    Blynk.virtualWrite(V4, 0);
+    return;
+  }
   if (param.asInt()) {
+    if (isPumping) return;
     digitalWrite(RELAY_PIN, HIGH);
-    Blynk.virtualWrite(V3, F("Manual Pump ON"));
-    Blynk.virtualWrite(V5, F("ON"));
+    isPumping       = true;
+    currentState    = STATE_PUMPING;
     manualLastPct   = readWaterLevel();
     manualNoRise    = 0;
     manualLastCheck = millis();
+    Blynk.virtualWrite(V3, F("Manual Pump ON"));
+    Blynk.virtualWrite(V5, F("ON"));
   } else {
     digitalWrite(RELAY_PIN, LOW);
-    Blynk.virtualWrite(V3, F("Monitoring"));
     Blynk.virtualWrite(V5, F("OFF"));
     manualNoRise = 0;
+    resetToIdle();
   }
 }
 
 BLYNK_WRITE(V12) {
-  // Chon pet profile
+  // Doi profile cung reset STATE_ERROR neu co
+  if (currentState == STATE_ERROR) currentState = STATE_IDLE;
   loadProfile(String(param.asInt()));
-}
-
-// ===================================================
-// PERIODIC CHECK
-// ===================================================
-
-void checkAndUpdate() {
-  Serial.println(F("========================"));
-  checkNewDay();
-
-  int   waterPct = readWaterLevel();
-  float foodGram = readFoodWeight();
-
-  Serial.print(F("Water: ")); Serial.print(waterPct); Serial.println(F("%"));
-  Serial.print(F("Food: "));  Serial.print(foodGram);  Serial.println(F("g"));
-
-  Blynk.virtualWrite(V0, waterPct);
-  Blynk.virtualWrite(V1, foodGram);
-  Blynk.virtualWrite(V6, F("Online"));
-  updateLCD("Monitoring...");
-
-  // Kiem tra nuoc
-  if (waterPct < waterLowPct) {
-    if (!waterEventSent) {
-      Blynk.logEvent("water_low", "Water level is low, refilling...");
-      waterEventSent = true;
-    }
-    pumpWater();
-  } else {
-    waterEventSent = false;
-  }
-
-  // Kiem tra thuc an
-  if (foodGram >= 0 && foodGram < foodTargetGram) {
-    if (!foodEventSent) {
-      Blynk.logEvent("food_low", "Food level is low, dispensing...");
-      foodEventSent = true;
-    }
-    dispenseFood();
-  } else {
-    foodEventSent = false;
-  }
-
-  // Cap nhat lan cuoi
-  waterPct = readWaterLevel();
-  foodGram = readFoodWeight();
-  updateLCD("OK - Ready");
-  Blynk.virtualWrite(V3, F("Monitoring"));
+  // Cap nhat ngay sau khi doi profile (goi y tu review)
+  checkWater();
+  checkFood();
 }
 
 // ===================================================
@@ -414,70 +541,51 @@ void setup() {
 
   lcd.init();
   lcd.backlight();
-  lcd.setCursor(0, 0);
-  lcd.print(F("Pet Feeder IoT"));
-  lcd.setCursor(0, 1);
-  lcd.print(F("Connecting..."));
+  setLCDLine0("Pet Feeder IoT");
+  setLCDLine1("Connecting...");
 
-  // ===== WiFiManager — khong hardcode WiFi =====
   WiFiManager wifiManager;
+  wifiManager.setConfigPortalTimeout(180);
 
-  // Giu nut BOOT 3 giay khi bat → reset WiFi
   if (digitalRead(RESET_PIN) == LOW) {
-    Serial.println(F("Resetting WiFi settings..."));
     wifiManager.resetSettings();
     delay(1000);
     ESP.restart();
   }
 
-  // Tu dong ket noi WiFi da luu
-  // Neu chua co → tao hotspot "PetFeeder-Setup"
   wifiManager.setAPCallback([](WiFiManager* wm) {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print(F("Connect to WiFi:"));
-    lcd.setCursor(0, 1);
-    lcd.print(F("PetFeeder-Setup"));
+    setLCDLine0("Connect WiFi:");
+    setLCDLine1("PetFeeder-Setup");
   });
 
   if (!wifiManager.autoConnect("PetFeeder-Setup")) {
-    Serial.println(F("WiFi failed, restarting..."));
-    delay(3000);
     ESP.restart();
   }
 
-  Serial.println(F("WiFi connected!"));
-
-  // ===== Blynk =====
   Blynk.config(BLYNK_AUTH_TOKEN);
   Blynk.connect();
 
-  // ===== NTP =====
   configTime(7 * 3600, 0, "pool.ntp.org");
   delay(2000);
 
-  // ===== Firebase =====
-fbConfig.api_key = FIREBASE_API_KEY;
-fbConfig.database_url = FIREBASE_DB_URL;
+  fbConfig.api_key               = FIREBASE_API_KEY;
+  fbConfig.database_url          = FIREBASE_DB_URL;
+  fbConfig.token_status_callback = tokenStatusCallback;
 
-fbConfig.token_status_callback = tokenStatusCallback;
-
-if (Firebase.signUp(&fbConfig, &fbAuth, "", "")) {
-  Serial.println("Firebase sign up OK");
-} else {
-  Serial.printf("Firebase sign up failed: %s\n",
-                fbConfig.signer.signupError.message.c_str());
-}
-
-Firebase.begin(&fbConfig, &fbAuth);
-Firebase.reconnectWiFi(true);
-
-  // Load active profile
-  if (Firebase.RTDB.getString(&fbdo, "/activeProfile")) {
-    loadProfile(fbdo.stringData());
+  if (Firebase.signUp(&fbConfig, &fbAuth, "", "")) {
+    Serial.println(F("Firebase OK"));
+  } else {
+    Serial.println(F("Firebase failed"));
   }
 
-  // Khoi tao ngay va trong luong dau ngay
+  Firebase.begin(&fbConfig, &fbAuth);
+  Firebase.reconnectWiFi(true);
+
+  if (Firebase.RTDB.getString(&fbdo, "/activeProfile"))
+    loadProfile(fbdo.stringData());
+  else
+    loadProfile("1");
+
   struct tm t;
   if (getLocalTime(&t)) {
     char today[12];
@@ -490,15 +598,15 @@ Firebase.reconnectWiFi(true);
   Blynk.virtualWrite(V6, F("Online"));
   Blynk.virtualWrite(V7, F("--"));
   Blynk.virtualWrite(V8, F("--"));
+  Blynk.virtualWrite(V3, F("Monitoring"));
 
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(F("Pet Feeder IoT"));
-  lcd.setCursor(0, 1);
-  lcd.print(("Pet: " + activePetName).c_str());
+  setLCDLine0("Pet Feeder IoT");
+  setLCDLine1(("Pet: " + activeProfile.name).c_str());
   delay(1500);
 
-  timer.setInterval(60000L, checkAndUpdate);
+  timer.setInterval(30000L, checkAndUpdate);
+  timer.setInterval(1000L,  updateLCDTime);
+
   Serial.println(F("=== Pet Feeder IoT Ready ==="));
 }
 
@@ -511,7 +619,8 @@ void loop() {
   timer.run();
   checkManualPump();
 
-  if (shouldFeed) {
+  if (shouldFeed && !isDispensing && !isPumping
+      && currentState != STATE_ERROR) {
     shouldFeed = false;
     dispenseFood();
   }
