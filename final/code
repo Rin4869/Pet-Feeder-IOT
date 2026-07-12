@@ -26,7 +26,7 @@
 #define SERVO_PIN            13
 #define RESET_PIN             0
 
-#define WATER_MIN         120
+#define WATER_MIN          120
 #define WATER_MAX         1300
 #define SCALE_FACTOR      400.0
 #define PUMP_MAX_ATTEMPTS  20
@@ -36,8 +36,6 @@
 #define NO_CHANGE_LIMIT     3
 #define LCD_WIDTH          16
 
-// ===== State Machine =====
-// STATE_ERROR da duoc xu ly day du, giu lai
 enum SystemState {
   STATE_IDLE,
   STATE_DISPENSING,
@@ -46,7 +44,6 @@ enum SystemState {
 };
 SystemState currentState = STATE_IDLE;
 
-// ===== Objects =====
 HX711 scale;
 Servo myServo;
 LiquidCrystal_I2C lcd(0x27, 16, 2);
@@ -55,31 +52,27 @@ FirebaseData fbdo;
 FirebaseAuth fbAuth;
 FirebaseConfig fbConfig;
 
-// ===== Pet Profile =====
 struct PetProfile {
-  String name        = "Default";
-  int foodLowGram    = 20;
-  int foodTargetGram = 70;
-  int waterLow       = 30;
-  int waterRefill    = 70;
+  String name          = "Default";
+  int    foodLowGram   = 20;
+  int    foodTargetGram = 70;
+  int    waterLow      = 30;
+  int    waterRefill   = 70;
 };
 PetProfile activeProfile;
 String activeProfileId = "";
 
-// ===== Flags =====
 bool shouldFeed     = false;
 bool isDispensing   = false;
 bool isPumping      = false;
 bool waterEventSent = false;
 bool foodEventSent  = false;
 
-// ===== Counters =====
 int    feedCountToday    = 0;
 int    refillCountToday  = 0;
 String lastDate          = "";
 float  foodWeightMorning = -1;
 
-// ===== Manual pump =====
 int           manualLastPct   = 0;
 int           manualNoRise    = 0;
 unsigned long manualLastCheck = 0;
@@ -96,10 +89,9 @@ String getCurrentTime() {
   return String(buf);
 }
 
-// Gioi han chuoi 16 ky tu, tranh tran LCD
 String truncate(String s) {
-  if (s.length() > LCD_WIDTH) s = s.substring(0, LCD_WIDTH);
-  while (s.length() < LCD_WIDTH) s += ' ';
+  if ((int)s.length() > LCD_WIDTH) s = s.substring(0, LCD_WIDTH);
+  while ((int)s.length() < LCD_WIDTH) s += ' ';
   return s;
 }
 
@@ -130,16 +122,16 @@ void resetToIdle(const char* lcdMsg = "OK - Ready") {
   setLCDLine1(lcdMsg);
 }
 
-// STATE_ERROR: hien thi loi, cho den khi user reset
 void enterErrorState(const char* reason) {
   currentState = STATE_ERROR;
   isDispensing = false;
   isPumping    = false;
   digitalWrite(RELAY_PIN, LOW);
   myServo.write(0);
+  Serial.print(F("ERROR: "));
+  Serial.println(reason);
   Blynk.virtualWrite(V3, reason);
   setLCDLine1(reason);
-  // Blynk se tiep tuc chay, user co the reset bang cach chon lai profile
 }
 
 // ===================================================
@@ -162,71 +154,126 @@ float readFoodWeight() {
 }
 
 // ===================================================
-// FIREBASE — doc JSON 1 lan thay vi nhieu request
+// FIREBASE UTILITIES
+// ===================================================
+
+bool firebaseReady() {
+  return Firebase.ready() && Firebase.authenticated();
+}
+
+// ===================================================
+// LOAD PROFILE — 1 JSON request + retry 3 lan
+// + enterErrorState khi that bai
 // ===================================================
 
 void loadProfile(String profileId) {
   if (profileId == activeProfileId && activeProfile.name != "Default") return;
 
-  String base = "/profiles/" + profileId;
-
-  // Doc tat ca truoc, neu that bai khong ap dung
-  String  newName    = activeProfile.name;
-  int     newFoodLow = activeProfile.foodLowGram;
-  int     newFoodTgt = activeProfile.foodTargetGram;
-  int     newWatLow  = activeProfile.waterLow;
-  int     newWatFill = activeProfile.waterRefill;
-  bool    ok         = true;
-
-  if (Firebase.RTDB.getString(&fbdo, base + "/name"))
-    newName = fbdo.stringData();
-  else ok = false;
-
-  if (ok && Firebase.RTDB.getInt(&fbdo, base + "/foodLow"))
-    newFoodLow = fbdo.intData();
-  else ok = false;
-
-  if (ok && Firebase.RTDB.getInt(&fbdo, base + "/foodTarget"))
-    newFoodTgt = fbdo.intData();
-  else ok = false;
-
-  if (ok && Firebase.RTDB.getInt(&fbdo, base + "/waterLow"))
-    newWatLow = fbdo.intData();
-  else ok = false;
-
-  if (ok && Firebase.RTDB.getInt(&fbdo, base + "/waterRefill"))
-    newWatFill = fbdo.intData();
-  else ok = false;
-
-  // Chi ap dung khi doc thanh cong tat ca
-  if (!ok) {
-    Blynk.virtualWrite(V3, F("Profile load fail"));
-    setLCDLine1("Profile Error   ");
+  if (!firebaseReady()) {
+    Serial.println(F("Firebase not ready, skip loadProfile"));
+    enterErrorState("Profile Error");
     return;
   }
 
-  activeProfile.name         = newName;
-  activeProfile.foodLowGram  = newFoodLow;
+  String base    = "/profiles/" + profileId;
+  bool   ok      = false;
+  int    retries = 0;
+
+  FirebaseJson     json;
+  FirebaseJsonData result;
+
+  // Retry toi da 3 lan
+  while (!ok && retries < 3) {
+    if (Firebase.RTDB.getJSON(&fbdo, base)) {
+      ok = true;
+    } else {
+      retries++;
+      Serial.print(F("Profile load retry: "));
+      Serial.println(retries);
+      delay(500);
+    }
+  }
+
+  if (!ok) {
+    Serial.println(F("Profile load failed after 3 retries"));
+    enterErrorState("Profile Error");
+    return;
+  }
+
+  // Parse JSON — chi apply khi tat ca thanh cong
+  json.setJsonData(fbdo.jsonString());
+
+  String newName    = activeProfile.name;
+  int    newFoodLow = activeProfile.foodLowGram;
+  int    newFoodTgt = activeProfile.foodTargetGram;
+  int    newWatLow  = activeProfile.waterLow;
+  int    newWatFill = activeProfile.waterRefill;
+  bool   parseOk    = true;
+
+  if (json.get(result, "name") && result.success)
+    newName = result.stringValue;
+  else parseOk = false;
+
+  if (parseOk && json.get(result, "foodLow") && result.success)
+    newFoodLow = result.intValue;
+  else parseOk = false;
+
+  if (parseOk && json.get(result, "foodTarget") && result.success)
+    newFoodTgt = result.intValue;
+  else parseOk = false;
+
+  if (parseOk && json.get(result, "waterLow") && result.success)
+    newWatLow = result.intValue;
+  else parseOk = false;
+
+  if (parseOk && json.get(result, "waterRefill") && result.success)
+    newWatFill = result.intValue;
+  else parseOk = false;
+
+  if (!parseOk) {
+    Serial.println(F("Profile JSON parse failed"));
+    enterErrorState("Profile Error");
+    return;
+  }
+
+  // Apply profile
+  activeProfile.name          = newName;
+  activeProfile.foodLowGram   = newFoodLow;
   activeProfile.foodTargetGram = newFoodTgt;
-  activeProfile.waterLow     = newWatLow;
-  activeProfile.waterRefill  = newWatFill;
-  activeProfileId            = profileId;
+  activeProfile.waterLow      = newWatLow;
+  activeProfile.waterRefill   = newWatFill;
+  activeProfileId             = profileId;
 
-  Firebase.RTDB.setString(&fbdo, "/activeProfile", profileId);
+  // Ghi activeProfile len Firebase
+  if (firebaseReady())
+    Firebase.RTDB.setString(&fbdo, "/activeProfile", profileId);
 
-  // Cap nhat ngay sau khi load
+  Serial.print(F("Profile: "));  Serial.println(activeProfile.name);
+  Serial.print(F("foodLow: "));  Serial.println(activeProfile.foodLowGram);
+  Serial.print(F("foodTgt: "));  Serial.println(activeProfile.foodTargetGram);
+  Serial.print(F("watLow: "));   Serial.println(activeProfile.waterLow);
+  Serial.print(F("watFill: "));  Serial.println(activeProfile.waterRefill);
+
   updateLCDTime();
   setLCDLine1(("Pet: " + activeProfile.name).c_str());
   Blynk.virtualWrite(V3, ("Pet: " + activeProfile.name).c_str());
 
-  // Gợi y: cap nhat sensor ngay sau khi doi profile
+  // Cap nhat sensor ngay sau khi doi profile
   int   w = readWaterLevel();
   float f = readFoodWeight();
   Blynk.virtualWrite(V0, w);
   if (f >= 0) Blynk.virtualWrite(V1, f);
 }
 
+// ===================================================
+// SYNC LOGS — kiem tra firebaseReady() truoc khi ghi
+// ===================================================
+
 void syncLogs() {
+  if (!firebaseReady()) {
+    Serial.println(F("Firebase not ready, skip syncLogs"));
+    return;
+  }
   Firebase.RTDB.setInt(&fbdo, "/logs/feedToday",   feedCountToday);
   Firebase.RTDB.setInt(&fbdo, "/logs/refillToday", refillCountToday);
 }
@@ -237,11 +284,11 @@ void syncLogs() {
 
 void dispenseFood() {
   if (isDispensing || isPumping) return;
-  if (currentState == STATE_ERROR) return; // khong nha khi dang loi
+  if (currentState == STATE_ERROR) return;
 
   float before = readFoodWeight();
   if (before < 0) {
-    Blynk.logEvent("sensor_error", "Load cell error, cannot dispense.");
+    Serial.println(F("Loadcell Error - cannot dispense"));
     enterErrorState("Sensor Error!");
     return;
   }
@@ -274,7 +321,7 @@ void dispenseFood() {
 
     float current = readFoodWeight();
     if (current < 0) {
-      Blynk.logEvent("sensor_error", "Load cell error during dispensing.");
+      Serial.println(F("Loadcell Error - during dispensing"));
       enterErrorState("Sensor Error!");
       return;
     }
@@ -303,14 +350,13 @@ void dispenseFood() {
     feedCountToday++;
     String t = getCurrentTime();
     Blynk.virtualWrite(V7, t);
-    Firebase.RTDB.setString(&fbdo, "/logs/lastFeed", t.c_str());
+    if (firebaseReady())
+      Firebase.RTDB.setString(&fbdo, "/logs/lastFeed", t.c_str());
     syncLogs();
   }
 
-  if (jammed)
-    resetToIdle("Food Jam/Empty!");
-  else
-    resetToIdle(dispensed > 0 ? "OK - Ready" : "Check Feeder!");
+  resetToIdle(jammed ? "Food Jam/Empty!" :
+              (dispensed > 0 ? "OK - Ready" : "Check Feeder!"));
 }
 
 // ===================================================
@@ -326,10 +372,10 @@ void pumpWater() {
   Blynk.virtualWrite(V3, F("Refilling..."));
   setLCDLine1("Refilling...");
 
-  int pct         = readWaterLevel();
-  int attempts    = 0;
-  int noRiseCount = 0;
-  int lastPct     = pct;
+  int pct          = readWaterLevel();
+  int attempts     = 0;
+  int noRiseCount  = 0;
+  int lastPct      = pct;
   bool sourceEmpty = false;
 
   while (pct < activeProfile.waterRefill && attempts < PUMP_MAX_ATTEMPTS) {
@@ -366,7 +412,8 @@ void pumpWater() {
     refillCountToday++;
     String t = getCurrentTime();
     Blynk.virtualWrite(V8, t);
-    Firebase.RTDB.setString(&fbdo, "/logs/lastRefill", t.c_str());
+    if (firebaseReady())
+      Firebase.RTDB.setString(&fbdo, "/logs/lastRefill", t.c_str());
     syncLogs();
     resetToIdle("OK - Ready");
   }
@@ -509,10 +556,8 @@ BLYNK_WRITE(V4) {
 }
 
 BLYNK_WRITE(V12) {
-  // Doi profile cung reset STATE_ERROR neu co
   if (currentState == STATE_ERROR) currentState = STATE_IDLE;
   loadProfile(String(param.asInt()));
-  // Cap nhat ngay sau khi doi profile (goi y tu review)
   checkWater();
   checkFood();
 }
@@ -580,6 +625,13 @@ void setup() {
 
   Firebase.begin(&fbConfig, &fbAuth);
   Firebase.reconnectWiFi(true);
+
+  // Cho Firebase san sang truoc khi doc
+  int waitCount = 0;
+  while (!firebaseReady() && waitCount < 10) {
+    delay(500);
+    waitCount++;
+  }
 
   if (Firebase.RTDB.getString(&fbdo, "/activeProfile"))
     loadProfile(fbdo.stringData());
