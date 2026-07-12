@@ -2,6 +2,7 @@
 Adapter 5V (+)	Rail +
 Adapter GND (-)	Rail -
 ESP32 GND	Rail -
+Vin rail +
 
 -LCD-
 VCC - Rail +
