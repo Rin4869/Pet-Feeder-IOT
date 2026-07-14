@@ -84,6 +84,10 @@ bool          isPumping       = false;
 bool          waterEventSent  = false;
 bool          foodEventSent   = false;
 
+// Giu canh bao "can bo sung" cho den khi nguoi dung do DU (target/refill)
+bool          waitingFood     = false;
+bool          waitingWater    = false;
+
 int           feedCountToday    = 0;
 int           refillCountToday  = 0;
 String        lastDate          = "";
@@ -164,8 +168,6 @@ void enterErrorState(const char* reason) {
 
 // Loi mang/Firebase — CANH BAO nhung KHONG khoa he thong
 void enterDegradedState(const char* reason) {
-  // Chi chuyen sang DEGRADED neu dang IDLE
-  // Neu dang DISPENSING/PUMPING thi giu nguyen, khong gian doan
   if (currentState == STATE_IDLE || currentState == STATE_DEGRADED) {
     currentState = STATE_DEGRADED;
   }
@@ -173,7 +175,6 @@ void enterDegradedState(const char* reason) {
   Serial.print(F("DEGRADED (offline): "));
   Serial.println(reason);
   Blynk.virtualWrite(V3, reason);
-  // LCD chi update neu khong dang ban viec khac
   if (currentState == STATE_DEGRADED)
     setLCDLine1(reason);
 }
@@ -189,7 +190,6 @@ bool isPumpReady() {
   return (millis() - lastPumpMillis) >= PUMP_COOLDOWN_MS;
 }
 
-// Kiem tra co the hoat dong khong (ca IDLE lan DEGRADED deu duoc)
 bool canOperate() {
   return currentState == STATE_IDLE || currentState == STATE_DEGRADED;
 }
@@ -230,8 +230,6 @@ void syncProfileToBlynk() {
   Blynk.virtualWrite(V14, activeProfile.feedIntervalHour);
 }
 
-// Doc doc lap tung truong — loi truong nao dung mac dinh truong do
-// KHONG bao gio goi enterErrorState
 void loadProfile() {
   if (!firebaseReady()) {
     Serial.println(F("Firebase not ready — running with defaults"));
@@ -265,7 +263,6 @@ void loadProfile() {
     return;
   }
 
-  // Doc doc lap — khong co parseOk day chuyen
   json.setJsonData(fbdo.jsonString());
 
   if (json.get(result, "name") && result.success)
@@ -290,7 +287,6 @@ void loadProfile() {
   firstFeedDone  = false;
   lastFeedMillis = 0;
 
-  // Load thanh cong — quay ve IDLE neu dang DEGRADED
   if (currentState == STATE_DEGRADED)
     currentState = STATE_IDLE;
 
@@ -308,7 +304,6 @@ void loadProfile() {
 void saveProfile() {
   if (!firebaseReady()) {
     Serial.println(F("Firebase not ready — save queued offline"));
-    // Ap dung pending vao active ngay, Firebase se sync khi co mang
     activeProfile = pendingProfile;
     firstFeedDone = false;
     lastFeedMillis = 0;
@@ -318,7 +313,6 @@ void saveProfile() {
     return;
   }
 
-  // Ep kieu tuong minh
   FirebaseJson json;
   json.set("name",         pendingProfile.name.c_str());
   json.set("foodLow",      (int)pendingProfile.foodLowGram);
@@ -340,8 +334,6 @@ void saveProfile() {
 
   if (!ok) {
     Serial.println(F("Save failed — applying locally"));
-    // Save that bai nhung van ap dung vao active
-    // KHONG goi enterErrorState
     activeProfile = pendingProfile;
     firstFeedDone = false;
     lastFeedMillis = 0;
@@ -355,7 +347,6 @@ void saveProfile() {
   firstFeedDone  = false;
   lastFeedMillis = 0;
 
-  // Save thanh cong — ve IDLE neu dang DEGRADED
   if (currentState == STATE_DEGRADED)
     currentState = STATE_IDLE;
 
@@ -371,7 +362,6 @@ void syncLogs() {
   Firebase.RTDB.setInt(&fbdo, "/logs/refillToday", refillCountToday);
 }
 
-// Thu ket noi lai Firebase dinh ky khi DEGRADED
 void retryFirebase() {
   if (currentState != STATE_DEGRADED) return;
   if (millis() - lastFirebaseRetry < FIREBASE_RETRY_MS) return;
@@ -382,22 +372,49 @@ void retryFirebase() {
 }
 
 // ===================================================
+// AUTO-RECOVERY — chi tat canh bao khi DA DU (target/refill),
+// khong chi vua vuot nguong "low"
+// ===================================================
+void checkRecovery() {
+  if (!canOperate()) return;
+
+  if (waitingFood) {
+    float food = readFoodWeight();
+    if (food >= 0 && food >= activeProfile.foodTargetGram) {
+      waitingFood = false;
+      Serial.println(F("Food refilled - back to OK"));
+      setLCDLine1("OK - Ready");
+    }
+  }
+
+  if (waitingWater) {
+    int water = readWaterLevel();
+    if (water >= activeProfile.waterRefill) {
+      waitingWater = false;
+      Serial.println(F("Water refilled - back to OK"));
+      setLCDLine1("OK - Ready");
+    }
+  }
+}
+
+// ===================================================
 // DISPENSE FOOD
 // ===================================================
 
 void dispenseFood() {
   if (isDispensing || isPumping) return;
-  if (!canOperate()) return;  // cho phep ca IDLE lan DEGRADED
+  if (!canOperate()) return;
 
   float before = readFoodWeight();
   if (before < 0) {
     Serial.println(F("Loadcell Error"));
-    enterErrorState("Sensor Error!");  // loi phan cung → KHOA
+    enterErrorState("Sensor Error!");
     return;
   }
 
   float target = activeProfile.foodTargetGram - before;
   if (target <= 0) {
+    waitingFood = false;
     Blynk.virtualWrite(V3, F("Food sufficient"));
     setLCDLine1("Food OK");
     return;
@@ -434,8 +451,9 @@ void dispenseFood() {
       noChangeCount++;
       if (noChangeCount >= NO_CHANGE_LIMIT) {
         jammed = true;
+        Serial.println(F("Food container empty or jam"));
         Blynk.logEvent("food_jam",
-          "Food jam or container empty.");
+          "Food container empty or jam");
         break;
       }
     } else {
@@ -452,6 +470,7 @@ void dispenseFood() {
     feedCountToday++;
     firstFeedDone  = true;
     lastFeedMillis = millis();
+    waitingFood    = false;
 
     String t = getCurrentTime();
     Blynk.virtualWrite(V7, t);
@@ -460,14 +479,17 @@ void dispenseFood() {
     syncLogs();
   }
 
-  // Sau khi dispense xong, quay ve dung trang thai cu (IDLE hoac DEGRADED)
+  if (jammed) {
+    waitingFood = true;
+  }
+
   bool wasDegraded = (currentState == STATE_DISPENSING &&
                       !firebaseReady());
   currentState = wasDegraded ? STATE_DEGRADED : STATE_IDLE;
   isDispensing = false;
 
   Blynk.virtualWrite(V3, F("Monitoring"));
-  setLCDLine1(jammed ? "Food Jam/Empty!" :
+  setLCDLine1(jammed ? "Add Food" :
               (dispensed > 0 ? "OK - Ready" : "Check Feeder!"));
 }
 
@@ -508,12 +530,20 @@ void pumpWater() {
 
     if (noRiseCount >= NO_RISE_LIMIT) {
       sourceEmpty = true;
-      Blynk.logEvent("source_empty", "Water source empty!");
+      Serial.println(F("Source water empty"));
+      Blynk.logEvent("water_empty",
+        "Please add water.");
       break;
     }
 
     lastPct = pct;
     attempts++;
+  }
+
+  if (!sourceEmpty && attempts >= PUMP_MAX_ATTEMPTS) {
+    Serial.println(F("Pump timeout"));
+    Blynk.logEvent("pump_timeout",
+      "Water not increasing.");
   }
 
   digitalWrite(RELAY_PIN, LOW);
@@ -525,6 +555,7 @@ void pumpWater() {
     refillCountToday++;
     firstPumpDone  = true;
     lastPumpMillis = millis();
+    waitingWater   = false;
 
     String t = getCurrentTime();
     Blynk.virtualWrite(V8, t);
@@ -533,17 +564,20 @@ void pumpWater() {
     syncLogs();
   }
 
-  // Quay ve dung trang thai cu
+  if (sourceEmpty) {
+    waitingWater = true;
+  }
+
   currentState = wasFirebaseOk ? STATE_IDLE : STATE_DEGRADED;
   isPumping    = false;
 
   Blynk.virtualWrite(V3, F("Monitoring"));
-  setLCDLine1(sourceEmpty ? "Refill Source!" :
-              (attempts >= PUMP_MAX_ATTEMPTS ? "Check Pump!" : "OK - Ready"));
+  setLCDLine1(sourceEmpty ? "Add Water" :
+              (attempts >= PUMP_MAX_ATTEMPTS ? "Check Pump" : "OK - Ready"));
 }
 
 // ===================================================
-// MANUAL PUMP DETECT
+// MANUAL PUMP DETECT (auto-off khi khong len nuoc)
 // ===================================================
 
 void checkManualPump() {
@@ -562,7 +596,9 @@ void checkManualPump() {
     digitalWrite(RELAY_PIN, LOW);
     Blynk.virtualWrite(V4, 0);
     Blynk.virtualWrite(V5, F("OFF"));
-    Blynk.logEvent("source_empty", "Water source empty!");
+    Serial.println(F("Source water empty"));
+    Blynk.logEvent("water_empty", "Please add water.");
+    waitingWater   = true;
     manualNoRise   = 0;
     firstPumpDone  = true;
     lastPumpMillis = millis();
@@ -570,7 +606,7 @@ void checkManualPump() {
     currentState = wasFirebaseOk ? STATE_IDLE : STATE_DEGRADED;
     isPumping    = false;
     Blynk.virtualWrite(V3, F("Monitoring"));
-    setLCDLine1("Refill Source!");
+    setLCDLine1("Add Water");
   }
 }
 
@@ -611,7 +647,7 @@ void checkNewDay() {
 // ===================================================
 
 void checkFood() {
-  if (!canOperate()) return;  // IDLE hoac DEGRADED deu chay
+  if (!canOperate()) return;
 
   float foodGram = readFoodWeight();
   if (foodGram < 0) return;
@@ -648,7 +684,8 @@ void checkWater() {
 void checkAndUpdate() {
   checkNewDay();
   Blynk.virtualWrite(V6, F("Online"));
-  retryFirebase();  // thu ket noi lai Firebase neu DEGRADED
+  retryFirebase();
+  checkRecovery();
   checkWater();
   checkFood();
 }
@@ -659,7 +696,7 @@ void checkAndUpdate() {
 
 BLYNK_WRITE(V2) {
   if (param.asInt() == 1 && !isDispensing && !isPumping
-      && canOperate()) {  // IDLE hoac DEGRADED deu duoc
+      && canOperate()) {
     firstFeedDone  = false;
     lastFeedMillis = 0;
     shouldFeed     = true;
@@ -687,12 +724,19 @@ BLYNK_WRITE(V4) {
     manualNoRise   = 0;
     firstPumpDone  = true;
     lastPumpMillis = millis();
-    String t = getCurrentTime();
-    Blynk.virtualWrite(V8, t);
 
-    if (firebaseReady()) {
-      Firebase.RTDB.setString(&fbdo, "/logs/lastRefill", t.c_str());
+    // Chi ghi lastRefill neu nuoc THUC SU da len toi muc refill,
+    // khong ghi khan neu nguoi dung bat/tat pump ma nuoc chua len
+    int pct = readWaterLevel();
+    if (pct >= activeProfile.waterRefill) {
+      waitingWater = false;
+      String t = getCurrentTime();
+      Blynk.virtualWrite(V8, t);
+      if (firebaseReady()) {
+        Firebase.RTDB.setString(&fbdo, "/logs/lastRefill", t.c_str());
+      }
     }
+
     bool wasFirebaseOk = firebaseReady();
     currentState = wasFirebaseOk ? STATE_IDLE : STATE_DEGRADED;
     isPumping    = false;
@@ -710,7 +754,6 @@ BLYNK_WRITE(V14) { pendingProfile.feedIntervalHour  = param.asInt(); }
 
 BLYNK_WRITE(V15) {
   if (param.asInt() == 1) {
-    // Save KHONG bao gio goi enterErrorState
     saveProfile();
   }
 }
@@ -795,7 +838,7 @@ void setup() {
     waitCount++;
   }
 
-  loadProfile();  // neu that bai thi DEGRADED, khong crash
+  loadProfile();
 
   struct tm t;
   if (getLocalTime(&t)) {
