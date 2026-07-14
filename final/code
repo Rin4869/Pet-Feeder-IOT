@@ -687,6 +687,12 @@ BLYNK_WRITE(V4) {
     manualNoRise   = 0;
     firstPumpDone  = true;
     lastPumpMillis = millis();
+    String t = getCurrentTime();
+    Blynk.virtualWrite(V8, t);
+
+    if (firebaseReady()) {
+      Firebase.RTDB.setString(&fbdo, "/logs/lastRefill", t.c_str());
+    }
     bool wasFirebaseOk = firebaseReady();
     currentState = wasFirebaseOk ? STATE_IDLE : STATE_DEGRADED;
     isPumping    = false;
