@@ -37,18 +37,28 @@
 #define LCD_WIDTH           16
 #define PUMP_COOLDOWN_MS   (30UL * 60UL * 1000UL)
 #define FIREBASE_RETRY_MS  (5UL  * 60UL * 1000UL)  // thu lai Firebase sau 5 phut
+#define WATER_SENSOR_FAIL_LIMIT 5                   // so lan doc bat thuong lien tiep truoc khi bao loi
+#define FOOD_RECOVER_LIMIT      3                   // so lan doc TOT lien tiep truoc khi go loi food
 
 // ===================================================
-// STATE MACHINE — tach 2 loai loi
+// STATE MACHINE — currentState chi con phan anh HOAT DONG
+// (dispensing/pumping/idle/degraded), KHONG con dai dien cho
+// loi phan cung nua. Loi phan cung tach rieng thanh 2 co doc lap
+// ben duoi (foodError / waterError) de khong khoa cheo nhau.
 // ===================================================
 enum SystemState {
   STATE_IDLE,
   STATE_DISPENSING,
   STATE_PUMPING,
-  STATE_ERROR,      // loi phan cung (sensor, servo) — KHOA he thong
-  STATE_DEGRADED    // loi mang/Firebase — CHAY OFFLINE voi gia tri mac dinh
+  STATE_DEGRADED    // loi mang/Firebase — CANH BAO nhung KHONG khoa he thong
 };
 SystemState currentState = STATE_IDLE;
+
+// Loi phan cung — tach rieng theo tung he thong con
+bool foodError  = false;   // HX711 loi -> chi khoa DISPENSE
+bool waterError = false;   // Cam bien nuoc loi -> chi khoa PUMP
+int  waterSensorFailCount = 0;
+int  foodRecoverCount     = 0;  // debounce: can doc TOT lien tiep moi go foodError
 
 // ===================================================
 // OBJECTS
@@ -145,28 +155,55 @@ void updateLCDTime() {
   setLCDLine0(buf);
 }
 
-void resetToIdle(const char* lcdMsg = "OK - Ready") {
-  currentState = STATE_IDLE;
-  isDispensing = false;
-  isPumping    = false;
-  Blynk.virtualWrite(V3, F("Monitoring"));
-  setLCDLine1(lcdMsg);
+// ===================================================
+// STATUS DISPLAY — noi duy nhat quyet dinh thong diep tren
+// LCD dong 2 / Blynk V3, uu tien: loi phan cung > hoat dong > degraded > idle
+// ===================================================
+void updateStatusDisplay() {
+  String msg;
+
+  if (foodError && waterError)               msg = "Food+Water Err!";
+  else if (foodError)                        msg = "Food Sensor Err!";
+  else if (waterError)                       msg = "Water Sensor Err!";
+  else if (currentState == STATE_DISPENSING) msg = "Dispensing...";
+  else if (currentState == STATE_PUMPING)    msg = "Refilling...";
+  else if (currentState == STATE_DEGRADED)   msg = "Offline-Defaults";
+  else                                       msg = "Monitoring";
+
+  Blynk.virtualWrite(V3, msg);
+  if (currentState == STATE_IDLE || currentState == STATE_DEGRADED)
+    setLCDLine1(msg.c_str());
 }
 
-// Loi phan cung — KHOA he thong, can user xu ly
-void enterErrorState(const char* reason) {
-  currentState = STATE_ERROR;
-  isDispensing = false;
-  isPumping    = false;
-  digitalWrite(RELAY_PIN, LOW);
+// Loi phan cung HE THONG THUC AN — chi khoa dispenseFood/checkFood,
+// KHONG dung toi relay/pump/water sensor
+void enterFoodErrorState(const char* reason) {
+  foodError        = true;
+  foodRecoverCount = 0;  // reset debounce moi khi vao loi
+  isDispensing     = false;
   myServo.write(0);
-  Serial.print(F("HW ERROR: "));
+  currentState = firebaseReady() ? STATE_IDLE : STATE_DEGRADED;
+  Serial.print(F("FOOD HW ERROR: "));
   Serial.println(reason);
-  Blynk.virtualWrite(V3, reason);
-  setLCDLine1(reason);
+  Blynk.logEvent("food_sensor_error", reason);
+  updateStatusDisplay();
 }
 
-// Loi mang/Firebase — CANH BAO nhung KHONG khoa he thong
+// Loi phan cung HE THONG NUOC — chi khoa pumpWater/checkWater/manual pump,
+// KHONG dung toi servo/loadcell
+void enterWaterErrorState(const char* reason) {
+  waterError = true;
+  isPumping  = false;
+  digitalWrite(RELAY_PIN, LOW);
+  Blynk.virtualWrite(V5, F("OFF"));
+  currentState = firebaseReady() ? STATE_IDLE : STATE_DEGRADED;
+  Serial.print(F("WATER HW ERROR: "));
+  Serial.println(reason);
+  Blynk.logEvent("water_sensor_error", reason);
+  updateStatusDisplay();
+}
+
+// Loi mang/Firebase — CANH BAO nhung KHONG khoa he thong nao ca
 void enterDegradedState(const char* reason) {
   if (currentState == STATE_IDLE || currentState == STATE_DEGRADED) {
     currentState = STATE_DEGRADED;
@@ -190,9 +227,9 @@ bool isPumpReady() {
   return (millis() - lastPumpMillis) >= PUMP_COOLDOWN_MS;
 }
 
-bool canOperate() {
-  return currentState == STATE_IDLE || currentState == STATE_DEGRADED;
-}
+// Moi he thong con co dieu kien hoat dong RIENG — day la fix chinh
+bool canOperateFood()  { return !foodError; }
+bool canOperateWater() { return !waterError; }
 
 // ===================================================
 // SENSORS
@@ -203,6 +240,17 @@ int readWaterLevel() {
   delay(100);
   int raw = analogRead(WATER_SENSOR_PIN);
   digitalWrite(WATER_SENSOR_VCC_PIN, LOW);
+
+  // Phat hien cam bien nuoc mat ket noi/hong: raw dung o cuc tri lien tuc
+  if (raw <= 0 || raw >= 4095) {
+    waterSensorFailCount++;
+    if (waterSensorFailCount >= WATER_SENSOR_FAIL_LIMIT && !waterError) {
+      enterWaterErrorState("Water Sensor Err!");
+    }
+  } else {
+    waterSensorFailCount = 0;
+  }
+
   return constrain(map(raw, WATER_MIN, WATER_MAX, 0, 100), 0, 100);
 }
 
@@ -372,28 +420,63 @@ void retryFirebase() {
 }
 
 // ===================================================
-// AUTO-RECOVERY — chi tat canh bao khi DA DU (target/refill),
-// khong chi vua vuot nguong "low"
+// AUTO-RECOVERY (nguong "da du" cho food/water thap)
 // ===================================================
 void checkRecovery() {
-  if (!canOperate()) return;
-
-  if (waitingFood) {
+  if (waitingFood && canOperateFood()) {
     float food = readFoodWeight();
     if (food >= 0 && food >= activeProfile.foodTargetGram) {
       waitingFood = false;
       Serial.println(F("Food refilled - back to OK"));
-      setLCDLine1("OK - Ready");
+      updateStatusDisplay();
     }
   }
 
-  if (waitingWater) {
+  if (waitingWater && canOperateWater()) {
     int water = readWaterLevel();
     if (water >= activeProfile.waterRefill) {
       waitingWater = false;
       Serial.println(F("Water refilled - back to OK"));
-      setLCDLine1("OK - Ready");
+      updateStatusDisplay();
     }
+  }
+}
+
+// ===================================================
+// AUTO-RECOVERY cho LOI PHAN CUNG — tu go loi khi cam bien
+// on dinh tro lai (debounce N lan doc TOT lien tiep de tranh
+// nhap nhay khi cam bien chap chon)
+// ===================================================
+void checkFoodErrorRecovery() {
+  if (!foodError) return;
+  if (isDispensing || isPumping) return;
+
+  float w = readFoodWeight();
+  if (w >= 0) {
+    foodRecoverCount++;
+    if (foodRecoverCount >= FOOD_RECOVER_LIMIT) {
+      foodError        = false;
+      foodRecoverCount = 0;
+      Serial.println(F("Food sensor recovered"));
+      updateStatusDisplay();
+    }
+  } else {
+    foodRecoverCount = 0;  // doc hong -> huy dem, phai on dinh lai tu dau
+  }
+}
+
+void checkWaterErrorRecovery() {
+  if (!waterError) return;
+  if (isDispensing || isPumping) return;
+  digitalWrite(WATER_SENSOR_VCC_PIN, HIGH);
+  delay(100);
+  int raw = analogRead(WATER_SENSOR_PIN);
+  digitalWrite(WATER_SENSOR_VCC_PIN, LOW);
+  if (raw > 0 && raw < 4095) {
+    waterError = false;
+    waterSensorFailCount = 0;
+    Serial.println(F("Water sensor recovered"));
+    updateStatusDisplay();
   }
 }
 
@@ -403,27 +486,24 @@ void checkRecovery() {
 
 void dispenseFood() {
   if (isDispensing || isPumping) return;
-  if (!canOperate()) return;
+  if (!canOperateFood()) return;
 
   float before = readFoodWeight();
   if (before < 0) {
-    Serial.println(F("Loadcell Error"));
-    enterErrorState("Sensor Error!");
+    enterFoodErrorState("Food Sensor Err!");
     return;
   }
 
   float target = activeProfile.foodTargetGram - before;
   if (target <= 0) {
     waitingFood = false;
-    Blynk.virtualWrite(V3, F("Food sufficient"));
     setLCDLine1("Food OK");
     return;
   }
 
   isDispensing = true;
   currentState = STATE_DISPENSING;
-  Blynk.virtualWrite(V3, F("Dispensing..."));
-  setLCDLine1("Dispensing...");
+  updateStatusDisplay();
 
   float dispensed     = 0;
   float lastDispensed = 0;
@@ -441,7 +521,7 @@ void dispenseFood() {
 
     float current = readFoodWeight();
     if (current < 0) {
-      enterErrorState("Sensor Error!");
+      enterFoodErrorState("Food Sensor Err!");
       return;
     }
 
@@ -483,12 +563,11 @@ void dispenseFood() {
     waitingFood = true;
   }
 
-  bool wasDegraded = (currentState == STATE_DISPENSING &&
-                      !firebaseReady());
+  bool wasDegraded = !firebaseReady();
   currentState = wasDegraded ? STATE_DEGRADED : STATE_IDLE;
   isDispensing = false;
+  updateStatusDisplay();
 
-  Blynk.virtualWrite(V3, F("Monitoring"));
   setLCDLine1(jammed ? "Add Food" :
               (dispensed > 0 ? "OK - Ready" : "Check Feeder!"));
 }
@@ -499,7 +578,7 @@ void dispenseFood() {
 
 void pumpWater() {
   if (isPumping || isDispensing) return;
-  if (!canOperate()) return;
+  if (!canOperateWater()) return;
   if (!isPumpReady()) {
     Serial.println(F("Pump cooldown active"));
     return;
@@ -507,10 +586,11 @@ void pumpWater() {
 
   isPumping    = true;
   currentState = STATE_PUMPING;
-  Blynk.virtualWrite(V3, F("Refilling..."));
-  setLCDLine1("Refilling...");
+  updateStatusDisplay();
 
-  int pct          = readWaterLevel();
+  int pct = readWaterLevel();
+  if (waterError) { isPumping = false; return; } // enterWaterErrorState() da xu ly
+
   int attempts     = 0;
   int noRiseCount  = 0;
   int lastPct      = pct;
@@ -524,6 +604,7 @@ void pumpWater() {
     delay(500);
 
     pct = readWaterLevel();
+    if (waterError) return; // relay da duoc tat trong enterWaterErrorState()
 
     if (pct <= lastPct) noRiseCount++;
     else                noRiseCount = 0;
@@ -570,8 +651,8 @@ void pumpWater() {
 
   currentState = wasFirebaseOk ? STATE_IDLE : STATE_DEGRADED;
   isPumping    = false;
+  updateStatusDisplay();
 
-  Blynk.virtualWrite(V3, F("Monitoring"));
   setLCDLine1(sourceEmpty ? "Add Water" :
               (attempts >= PUMP_MAX_ATTEMPTS ? "Check Pump" : "OK - Ready"));
 }
@@ -583,11 +664,14 @@ void pumpWater() {
 void checkManualPump() {
   if (currentState != STATE_PUMPING) return;
   if (!isPumping) return;
+  if (waterError) return;
   if (digitalRead(RELAY_PIN) == LOW) return;
   if (millis() - manualLastCheck < 1500) return;
   manualLastCheck = millis();
 
   int pct = readWaterLevel();
+  if (waterError) return; // vua duoc xu ly boi enterWaterErrorState()
+
   if (pct <= manualLastPct) manualNoRise++;
   else                      manualNoRise = 0;
   manualLastPct = pct;
@@ -605,8 +689,7 @@ void checkManualPump() {
     bool wasFirebaseOk = firebaseReady();
     currentState = wasFirebaseOk ? STATE_IDLE : STATE_DEGRADED;
     isPumping    = false;
-    Blynk.virtualWrite(V3, F("Monitoring"));
-    setLCDLine1("Add Water");
+    updateStatusDisplay();
   }
 }
 
@@ -647,7 +730,7 @@ void checkNewDay() {
 // ===================================================
 
 void checkFood() {
-  if (!canOperate()) return;
+  if (!canOperateFood()) return;
 
   float foodGram = readFoodWeight();
   if (foodGram < 0) return;
@@ -665,9 +748,10 @@ void checkFood() {
 }
 
 void checkWater() {
-  if (!canOperate()) return;
+  if (!canOperateWater()) return;
 
   int waterPct = readWaterLevel();
+  if (waterError) return; // vua phat hien loi trong lan doc nay
   Blynk.virtualWrite(V0, waterPct);
 
   if (waterPct < activeProfile.waterLow && isPumpReady()) {
@@ -685,6 +769,8 @@ void checkAndUpdate() {
   checkNewDay();
   Blynk.virtualWrite(V6, F("Online"));
   retryFirebase();
+  checkFoodErrorRecovery();
+  checkWaterErrorRecovery();
   checkRecovery();
   checkWater();
   checkFood();
@@ -696,7 +782,7 @@ void checkAndUpdate() {
 
 BLYNK_WRITE(V2) {
   if (param.asInt() == 1 && !isDispensing && !isPumping
-      && canOperate()) {
+      && canOperateFood()) {
     firstFeedDone  = false;
     lastFeedMillis = 0;
     shouldFeed     = true;
@@ -704,7 +790,7 @@ BLYNK_WRITE(V2) {
 }
 
 BLYNK_WRITE(V4) {
-  if (isDispensing || currentState == STATE_ERROR) {
+  if (isDispensing || waterError) {
     Blynk.virtualWrite(V4, 0);
     return;
   }
@@ -716,7 +802,7 @@ BLYNK_WRITE(V4) {
     manualLastPct   = readWaterLevel();
     manualNoRise    = 0;
     manualLastCheck = millis();
-    Blynk.virtualWrite(V3, F("Manual Pump ON"));
+    updateStatusDisplay();
     Blynk.virtualWrite(V5, F("ON"));
   } else {
     digitalWrite(RELAY_PIN, LOW);
@@ -728,7 +814,7 @@ BLYNK_WRITE(V4) {
     // Chi ghi lastRefill neu nuoc THUC SU da len toi muc refill,
     // khong ghi khan neu nguoi dung bat/tat pump ma nuoc chua len
     int pct = readWaterLevel();
-    if (pct >= activeProfile.waterRefill) {
+    if (!waterError && pct >= activeProfile.waterRefill) {
       waitingWater = false;
       String t = getCurrentTime();
       Blynk.virtualWrite(V8, t);
@@ -740,8 +826,7 @@ BLYNK_WRITE(V4) {
     bool wasFirebaseOk = firebaseReady();
     currentState = wasFirebaseOk ? STATE_IDLE : STATE_DEGRADED;
     isPumping    = false;
-    Blynk.virtualWrite(V3, F("Monitoring"));
-    setLCDLine1("OK - Ready");
+    updateStatusDisplay();
   }
 }
 
@@ -852,7 +937,7 @@ void setup() {
   Blynk.virtualWrite(V6, F("Online"));
   Blynk.virtualWrite(V7, F("--"));
   Blynk.virtualWrite(V8, F("--"));
-  Blynk.virtualWrite(V3, F("Monitoring"));
+  updateStatusDisplay();
 
   setLCDLine0("Pet Feeder IoT");
   setLCDLine1(("Pet: " + activeProfile.name).c_str());
@@ -873,7 +958,7 @@ void loop() {
   timer.run();
   checkManualPump();
 
-  if (shouldFeed && !isDispensing && !isPumping && canOperate()) {
+  if (shouldFeed && !isDispensing && !isPumping && canOperateFood()) {
     shouldFeed = false;
     dispenseFood();
   }
